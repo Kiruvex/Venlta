@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Venlta</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script>
+    // QWebChannel signal null-safety: Qt 6's QWebChannel JS library may use
+    // spread syntax (...args) on null signal arguments, causing
+    // "object null is not iterable" errors. These global handlers
+    // suppress those non-critical errors from QWebChannel internals.
+    window.addEventListener('error', function(e) {
+      if (e.message && e.message.includes('object null is not iterable')) {
+        e.stopImmediatePropagation();
+        e.preventDefault();
+        return true;
+      }
+    }, true);
+    window.addEventListener('unhandledrejection', function(e) {
+      if (e.reason && String(e.reason).includes('object null is not iterable')) {
+        e.preventDefault();
+      }
+    });
+  </script>
+  <script type="module" crossorigin src="/assets/index-0L7K8K_K.js"></script>
+  <link rel="stylesheet" crossorigin href="/assets/index-CEzbjE34.css">
+</head>
+<body class="bg-gray-50 dark:bg-gray-900">
+  <div id="app"></div>
+</body>
+</html>
