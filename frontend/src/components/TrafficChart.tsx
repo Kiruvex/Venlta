@@ -228,7 +228,7 @@ export function TrafficChart({ data, height = 160, uploadLabel = 'Upload', downl
   return (
     // Wrapper: explicit height ensures the container has non-zero dimensions
     // even before uPlot renders, preventing 0-size initialization issues.
-    <div style={{ width: '100%', height, position: 'relative' }}>
+    <div style={{ width: '100%', minHeight: height + 28, position: 'relative' }}>
       {/* Chart canvas container -- uPlot appends its DOM here exclusively.
           Separating this from overlay elements prevents uPlot layout interference. */}
       <div ref={chartRef} style={{ width: '100%', height }} />

@@ -55,11 +55,76 @@ class SubscriptionManager:
             if not sub:
                 return {"ok": False, "error": "Subscription not found"}
             
-            resp = httpx.get(sub['url'], timeout=30,
-                headers={"User-Agent": "ClashForWindows/0.20.39"})
+            # 生成设备标识（参考 NekoBox HTTPRequestHelper.cpp:91-128）
+            # 使用机器名 + 系统 UUID 生成稳定的设备标识
+            import platform
+            import uuid as _sys_uuid
+            device_id = str(_sys_uuid.getnode())  # MAC address based device ID
+            device_os = platform.system()
+            ver_os = platform.version()
+            device_model = platform.machine()
+            
+            # 自定义 HWID 参数覆盖（参考 NekoBox GetHWID / sub_custom_hwid_params）
+            # 格式: "hwid=xxx,os=xxx,osversion=xxx,model=xxx"
+            # 每个键值对可覆盖自动检测的设备信息
+            custom_hwid_params = self.db.get_setting("custom_hwid_params", "")
+            if custom_hwid_params and isinstance(custom_hwid_params, str):
+                custom = {}
+                for pair in custom_hwid_params.split(','):
+                    pair = pair.strip()
+                    eq = pair.find('=')
+                    if eq > 0:
+                        custom[pair[:eq].strip().lower()] = pair[eq+1:].strip()
+                if 'hwid' in custom:
+                    device_id = custom['hwid']
+                if 'os' in custom:
+                    device_os = custom['os']
+                if 'osversion' in custom:
+                    ver_os = custom['osversion']
+                if 'model' in custom:
+                    device_model = custom['model']
+            
+            request_headers = {
+                "User-Agent": "ClashForWindows/0.20.39",
+                "x-hwid": device_id,
+                "x-device-os": device_os,
+                "x-ver-os": ver_os,
+                "x-device-model": device_model,
+            }
+            resp = httpx.get(sub['url'], timeout=30, headers=request_headers)
             if resp.status_code != 200:
                 return {"ok": False, "error": f"HTTP {resp.status_code}"}
-            
+
+            # 解析 Profile-Title HTTP header（参考 NekoBox GroupUpdater.cpp:1180-1199）
+            # 部分订阅源通过此 header 返回订阅名称
+            # NekoBox 支持 base64: 前缀递归解码（最多 33 次）
+            profile_title = resp.headers.get('profile-title', resp.headers.get('Profile-Title', ''))
+            if profile_title:
+                profile_title = profile_title.strip()
+                # 递归解码 base64: 前缀（参考 NekoBox GroupUpdater.cpp:1186-1193）
+                decode_counter = 0
+                while profile_title.startswith('base64:') and decode_counter < 33:
+                    decode_counter += 1
+                    import base64 as _b64
+                    try:
+                        b64_data = profile_title[7:].encode('utf-8')
+                        decoded = _b64.b64decode(b64_data).decode('utf-8').strip()
+                        if decoded:
+                            profile_title = decoded
+                        else:
+                            break
+                    except Exception:
+                        break
+                # 如果非 base64 编码，尝试 URL 解码
+                if not profile_title.startswith('base64:'):
+                    from urllib.parse import unquote
+                    try:
+                        profile_title = unquote(profile_title)
+                    except Exception:
+                        pass
+                self.db.update_subscription(sub_id, {"name": profile_title})
+                logger.info(f"Subscription name updated from Profile-Title header: {profile_title}")
+
             content = resp.text
             # 尝试 Base64 解码（兼容多种编码格式）
             import base64
@@ -93,11 +158,19 @@ class SubscriptionManager:
             content_preview = content[:300]
             logger.info(f"Subscription content length={len(content)}, starts_with={content[:20]!r}, preview={content_preview!r}")
 
-            # 解析节点（优先级：sing-box JSON > Clash YAML > 代理链接逐行解析）
+            # 解析节点（优先级：SIP008 > WireGuard 配置 > sing-box JSON > Clash YAML > 代理链接逐行解析）
             parser_used = 'none'
-            nodes = self._parse_singbox_json(content, sub_id)
+            nodes = self._parse_sip008(content, sub_id)
             if nodes:
-                parser_used = 'singbox_json'
+                parser_used = 'sip008'
+            if not nodes:
+                nodes = self._parse_wireguard_config(content, sub_id)
+                if nodes:
+                    parser_used = 'wireguard_config'
+            if not nodes:
+                nodes = self._parse_singbox_json(content, sub_id)
+                if nodes:
+                    parser_used = 'singbox_json'
             if not nodes:
                 nodes = self._parse_clash_yaml(content, sub_id)
                 if nodes:
@@ -116,8 +189,87 @@ class SubscriptionManager:
             
             # 收集所有现有节点的 tag（包括其他订阅的），用于检测跨订阅 tag 冲突
             all_existing_tags = {node.get('tag') for node in old_nodes}
+
+            # 订阅去重（参考 NekoBox ProfileFilter.Common()）
+            # 按 protocol + address + port + config 关键字段 去重，防止重复节点。
+            # 对于同一订阅内的旧节点：如果新节点列表中存在相同（protocol+address+port+关键config）的节点，
+            # 则保留旧节点（保留用户的自定义设置如启用/禁用状态），跳过添加新节点。
+            # 对于新节点列表内的重复：跳过后续重复项。
+            def _node_identity_key(node_data: dict) -> str:
+                """生成节点唯一标识（用于去重），参考 NekoBox ProfileFilter"""
+                protocol = node_data.get('protocol', '')
+                address = node_data.get('address', '')
+                port = str(node_data.get('port', 0))
+                config = node_data.get('config', {})
+                # 每种协议的关键标识字段
+                if protocol == 'vmess':
+                    key = config.get('uuid', '')
+                elif protocol == 'vless':
+                    key = config.get('uuid', '')
+                elif protocol == 'trojan':
+                    key = config.get('password', '')
+                elif protocol == 'shadowsocks':
+                    key = f"{config.get('method', '')}:{config.get('password', '')}"
+                elif protocol == 'hysteria2':
+                    key = config.get('password', '')
+                elif protocol == 'wireguard':
+                    key = f"{config.get('privateKey', config.get('private_key', ''))}"
+                elif protocol == 'tuic':
+                    key = f"{config.get('uuid', '')}:{config.get('password', '')}"
+                else:
+                    key = ''
+                return f"{protocol}:{address}:{port}:{key}"
+
+            # 构建旧节点（同订阅）的唯一标识集合
+            old_sub_nodes = [n for n in old_nodes if n.get('subscriptionId') == sub_id]
+            old_identity_set = set()
+            old_id_to_identity = {}  # id → identity_key，用于后续决定是否删除旧节点
+            for n in old_sub_nodes:
+                ik = _node_identity_key(n)
+                old_identity_set.add(ik)
+                old_id_to_identity[n['id']] = ik
+
+            # 构建新节点的唯一标识集合，去重
+            new_identity_set = set()
+            deduped_nodes = []
+            duplicate_count = 0
+            for node_data in nodes:
+                ik = _node_identity_key(node_data)
+                # 跳过新节点列表内的重复
+                if ik in new_identity_set:
+                    duplicate_count += 1
+                    continue
+                new_identity_set.add(ik)
+                deduped_nodes.append(node_data)
             
-            # 删除旧节点（先删后加，因为 tag UNIQUE 约束需要先清理同 tag 的旧节点）
+            if duplicate_count > 0:
+                logger.info(f"Subscription dedup: skipped {duplicate_count} duplicate nodes in new subscription data")
+
+            # 确定需要删除的旧节点：旧节点中不在新节点列表中的应删除
+            # 保留旧节点中与新节点匹配的（保留用户的启用/禁用等设置）
+            nodes_to_delete = []
+            identities_to_keep = new_identity_set  # 新节点中存在的身份标识
+            for nid in old_node_ids:
+                ik = old_id_to_identity.get(nid, '')
+                if ik and ik in identities_to_keep:
+                    # 旧节点与新节点匹配，保留旧节点（不删除）
+                    # 但需要从新节点列表中移除对应的条目（避免重复添加）
+                    pass
+                else:
+                    nodes_to_delete.append(nid)
+
+            # 从新节点列表中过滤掉与保留旧节点匹配的条目
+            retained_identities = set()
+            for nid in old_node_ids:
+                ik = old_id_to_identity.get(nid, '')
+                if ik and ik in identities_to_keep:
+                    retained_identities.add(ik)
+            final_new_nodes = [n for n in deduped_nodes if _node_identity_key(n) not in retained_identities]
+            
+            if retained_identities:
+                logger.info(f"Subscription dedup: retained {len(retained_identities)} existing nodes (preserving user settings)")
+            
+            # 删除不在新节点列表中的旧节点
             # 使用 DatabaseManager 公开 API（delete_node/add_node），确保：
             # 1. config 加密序列化逻辑一致
             # 2. tag 唯一性校验不遗漏
@@ -126,11 +278,28 @@ class SubscriptionManager:
             # 缓解措施：订阅数据始终可从原始 URL 重新拉取，如果中途失败：
             # 1. 用户点击"刷新订阅"即可恢复
             # 2. 下面的重试机制会自动重试一次添加失败的节点
+            # ★ 为订阅节点自动设置 group_id ★
+            # 从订阅记录中读取关联的 group_id，使订阅的节点归入对应分组
+            sub_group_id = sub.get('groupId') or sub.get('group_id')
+            if sub_group_id:
+                for node_data in final_new_nodes:
+                    if not node_data.get('group_id'):
+                        node_data['group_id'] = sub_group_id
+                # 同时更新保留的旧节点的 group_id（旧订阅可能没有 group_id）
+                for n in old_sub_nodes:
+                    nid = n.get('id')
+                    old_group = n.get('groupId') or n.get('group_id')
+                    if nid and not old_group and nid not in nodes_to_delete:
+                        try:
+                            self.db.update_node(nid, {'group_id': sub_group_id})
+                        except Exception:
+                            pass  # 更新失败不影响主流程
+
             failed_adds = []  # 记录添加失败的节点，用于重试
             try:
-                for nid in old_node_ids:
+                for nid in nodes_to_delete:
                     self.db.delete_node(nid)
-                for node_data in nodes:
+                for node_data in final_new_nodes:
                     # 如果新节点 tag 与其他订阅的节点冲突，添加后缀
                     base_tag = node_data.get('tag', '')
                     final_tag = base_tag
@@ -173,6 +342,186 @@ class SubscriptionManager:
             logger.error(f"Failed to update subscription {sub_id}: {e}")
             return {"ok": False, "error": str(e)}
     
+    def _parse_sip008(self, content: str, sub_id: str) -> list:
+        """尝试解析 SIP008 ShadowSocks JSON 格式的订阅内容
+
+        SIP008 格式示例：
+        {
+          "version": 8,
+          "servers": [
+            {
+              "server": "1.2.3.4",
+              "server_port": 8388,
+              "method": "aes-256-gcm",
+              "password": "password",
+              "remarks": "Server 1"
+            }
+          ]
+        }
+        """
+        content_stripped = content.strip()
+        if not content_stripped.startswith('{'):
+            return []
+        try:
+            data = json.loads(content_stripped)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        # SIP008 必须有 "version" 键且值为 8
+        if data.get('version') != 8:
+            return []
+        servers = data.get('servers', [])
+        if not servers:
+            return []
+        import uuid as _uid
+        nodes = []
+        SUPPORTED_SS_METHODS = {'aes-256-gcm', 'aes-128-gcm', 'chacha20-ietf-poly1305',
+                                'xchacha20-ietf-poly1305', '2022-blake3-aes-128-gcm',
+                                '2022-blake3-aes-256-gcm', '2022-blake3-chacha20-poly1305',
+                                'none'}
+        for srv in servers:
+            if not isinstance(srv, dict):
+                continue
+            method = srv.get('method', '')
+            password = srv.get('password', '')
+            server = srv.get('server', '')
+            port = int(srv.get('server_port', 0) or 0)
+            name = srv.get('remarks', srv.get('server', 'SS'))
+            if not method or not password or not server:
+                continue
+            if port <= 0 or port > 65535:
+                continue
+            if method.lower() not in SUPPORTED_SS_METHODS:
+                logger.warning(f"Skipping SIP008 server '{name}' with unsupported method: {method}")
+                continue
+            config = {'method': method, 'password': password}
+            nodes.append({
+                'name': name, 'protocol': 'shadowsocks', 'address': server, 'port': port,
+                'tag': f"ss-{_uid.uuid4().hex[:16]}", 'config': config,
+                'subscription_id': sub_id, 'is_enabled': 1,
+            })
+        if nodes:
+            logger.info(f"Parsed {len(nodes)} nodes from SIP008 format")
+        return nodes
+
+    def _parse_wireguard_config(self, content: str, sub_id: str) -> list:
+        """解析 WireGuard INI 风格配置文件
+
+        WireGuard .conf 文件格式：
+        [Interface]
+        PrivateKey = xxx
+        Address = 172.19.0.1/24
+        DNS = 1.1.1.1
+
+        [Peer]
+        PublicKey = yyy
+        Endpoint = 1.2.3.4:51820
+        AllowedIPs = 0.0.0.0/0
+        Reserved = 123,456,789
+        """
+        content_stripped = content.strip()
+        # 快速检查：必须包含 [Interface] 和 [Peer] 段
+        if '[Interface]' not in content_stripped or '[Peer]' not in content_stripped:
+            return []
+
+        import uuid as _uid
+        import re
+
+        # 解析 INI 风格段落
+        interface = {}
+        peers = []
+        current_section = None
+        current_data = {}
+
+        for line in content_stripped.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#') or line.startswith(';'):
+                continue
+            # 段落头
+            m = re.match(r'^\[(\w+)\]$', line)
+            if m:
+                if current_section == 'Interface':
+                    interface = current_data
+                elif current_section == 'Peer':
+                    peers.append(current_data)
+                current_section = m.group(1)
+                current_data = {}
+                continue
+            # Key = Value
+            if '=' in line and current_section:
+                key, _, value = line.partition('=')
+                current_data[key.strip()] = value.strip()
+
+        # 不要忘记最后一个段落
+        if current_section == 'Interface':
+            interface = current_data
+        elif current_section == 'Peer':
+            peers.append(current_data)
+
+        if not interface.get('PrivateKey') or not peers:
+            return []
+
+        nodes = []
+        private_key = interface.get('PrivateKey', '')
+        local_addresses = [a.strip() for a in interface.get('Address', '').split(',') if a.strip()]
+
+        for peer in peers:
+            peer_public_key = peer.get('PublicKey', '')
+            endpoint = peer.get('Endpoint', '')
+            if not peer_public_key or not endpoint:
+                continue
+
+            # 解析 endpoint: host:port
+            # 处理 IPv6: [::1]:port
+            if endpoint.startswith('['):
+                bracket_end = endpoint.find(']')
+                if bracket_end < 0:
+                    continue
+                host = endpoint[1:bracket_end]
+                port_str = endpoint[bracket_end+1:].lstrip(':')
+            else:
+                # IPv4 或主机名
+                parts = endpoint.rsplit(':', 1)
+                if len(parts) != 2:
+                    continue
+                host, port_str = parts
+
+            try:
+                port = int(port_str)
+            except (ValueError, TypeError):
+                continue
+
+            if port <= 0 or port > 65535 or not host:
+                continue
+
+            # 解析 reserved（逗号分隔整数）
+            reserved = []
+            reserved_str = peer.get('Reserved', '')
+            if reserved_str:
+                try:
+                    reserved = [int(x.strip()) for x in reserved_str.split(',') if x.strip().isdigit()]
+                except (ValueError, TypeError):
+                    reserved = []
+
+            config = {
+                'privateKey': private_key,
+                'peerPublicKey': peer_public_key,
+                'reserved': reserved,
+                'localAddress': local_addresses,
+            }
+
+            name = peer.get('Remarks', f"WireGuard-{host}")
+            nodes.append({
+                'name': name, 'protocol': 'wireguard', 'address': host, 'port': port,
+                'tag': f"wg-{_uid.uuid4().hex[:16]}", 'config': config,
+                'subscription_id': sub_id, 'is_enabled': 1,
+            })
+
+        if nodes:
+            logger.info(f"Parsed {len(nodes)} nodes from WireGuard config format")
+        return nodes
+
     def _parse_singbox_json(self, content: str, sub_id: str) -> list:
         """尝试解析 sing-box JSON 格式的订阅内容
 
@@ -274,6 +623,10 @@ class SubscriptionManager:
                         config['sni'] = tls['server_name']
                     if tls.get('insecure'):
                         config['allowInsecure'] = True
+                    # uTLS fingerprint
+                    utls = tls.get('utls', {})
+                    if isinstance(utls, dict) and utls.get('fingerprint'):
+                        config['utlsFingerprint'] = utls['fingerprint']
                 return {
                     'name': tag, 'protocol': 'vmess', 'address': server, 'port': port,
                     'tag': f"vmess-{_uid.uuid4().hex[:16]}", 'config': config,
@@ -315,6 +668,10 @@ class SubscriptionManager:
                             config['realityPublicKey'] = reality['public_key']
                         if reality.get('short_id'):
                             config['realityShortId'] = reality['short_id']
+                    # uTLS fingerprint
+                    utls = tls.get('utls', {})
+                    if isinstance(utls, dict) and utls.get('fingerprint'):
+                        config['utlsFingerprint'] = utls['fingerprint']
                 return {
                     'name': tag, 'protocol': 'vless', 'address': server, 'port': port,
                     'tag': f"vless-{_uid.uuid4().hex[:16]}", 'config': config,
@@ -333,6 +690,10 @@ class SubscriptionManager:
                         config['sni'] = tls['server_name']
                     if tls.get('insecure'):
                         config['allowInsecure'] = True
+                    # uTLS fingerprint
+                    utls = tls.get('utls', {})
+                    if isinstance(utls, dict) and utls.get('fingerprint'):
+                        config['utlsFingerprint'] = utls['fingerprint']
                 # 传输层
                 transport = out.get('transport', {})
                 if isinstance(transport, dict):
@@ -363,6 +724,10 @@ class SubscriptionManager:
                         config['sni'] = tls['server_name']
                     if tls.get('insecure'):
                         config['allowInsecure'] = True
+                    # uTLS fingerprint
+                    utls = tls.get('utls', {})
+                    if isinstance(utls, dict) and utls.get('fingerprint'):
+                        config['utlsFingerprint'] = utls['fingerprint']
                 # 混淆
                 obfs = out.get('obfs', {})
                 if isinstance(obfs, dict) and obfs.get('type'):
@@ -373,6 +738,48 @@ class SubscriptionManager:
                 return {
                     'name': tag, 'protocol': 'hysteria2', 'address': server, 'port': port,
                     'tag': f"hy2-{_uid.uuid4().hex[:16]}", 'config': config,
+                    'subscription_id': sub_id, 'is_enabled': 1,
+                }
+
+            elif ptype == 'tuic':
+                password = out.get('password', '')
+                uuid_val = out.get('uuid', '')
+                if not password or not uuid_val:
+                    return None
+                config = {'uuid': uuid_val, 'password': password, 'tls': True}
+                tls = out.get('tls', {})
+                if isinstance(tls, dict):
+                    if tls.get('server_name'):
+                        config['sni'] = tls['server_name']
+                    if tls.get('insecure'):
+                        config['allowInsecure'] = True
+                    if tls.get('disable_sni'):
+                        config['disableSni'] = True
+                    # alpn：sing-box 格式为数组，存储为逗号分隔字符串
+                    alpn_val = tls.get('alpn', [])
+                    if isinstance(alpn_val, list) and alpn_val:
+                        config['alpn'] = ','.join(alpn_val)
+                    elif isinstance(alpn_val, str) and alpn_val:
+                        config['alpn'] = alpn_val
+                    # uTLS fingerprint
+                    utls = tls.get('utls', {})
+                    if isinstance(utls, dict) and utls.get('fingerprint'):
+                        config['utlsFingerprint'] = utls['fingerprint']
+                # TUIC 特有字段（参考 NekoBox QUICBean.cpp:224-233）
+                if out.get('congestion_control'):
+                    config['congestionControl'] = out['congestion_control']
+                if out.get('udp_relay_mode'):
+                    config['udpRelayMode'] = out['udp_relay_mode']
+                # udp_over_stream 与 udp_relay_mode 互斥
+                if out.get('udp_over_stream'):
+                    config['uos'] = True
+                if out.get('zero_rtt_handshake'):
+                    config['zeroRttHandshake'] = out['zero_rtt_handshake']
+                if out.get('heartbeat'):
+                    config['heartbeat'] = out['heartbeat']
+                return {
+                    'name': tag, 'protocol': 'tuic', 'address': server, 'port': port,
+                    'tag': f"tuic-{_uid.uuid4().hex[:16]}", 'config': config,
                     'subscription_id': sub_id, 'is_enabled': 1,
                 }
 
@@ -689,6 +1096,10 @@ class SubscriptionManager:
                         config['sni'] = proxy.get('servername')
                     if proxy.get('skip-cert-verify') in (True, 'true', '1'):
                         config['allowInsecure'] = True
+                    # uTLS fingerprint (Clash: client-fingerprint)
+                    fp = proxy.get('client-fingerprint', '')
+                    if fp:
+                        config['utlsFingerprint'] = fp
                 return {
                     'name': name, 'protocol': 'vmess', 'address': server, 'port': port,
                     'tag': f"vmess-{_uid.uuid4().hex[:16]}", 'config': config,
@@ -711,6 +1122,10 @@ class SubscriptionManager:
                         config['sni'] = sni
                     if proxy.get('skip-cert-verify') in (True, 'true', '1'):
                         config['allowInsecure'] = True
+                    # uTLS fingerprint (Clash: client-fingerprint)
+                    fp = proxy.get('client-fingerprint', '')
+                    if fp:
+                        config['utlsFingerprint'] = fp
                     # Reality
                     if proxy.get('reality-opts') and isinstance(proxy.get('reality-opts'), dict):
                         config['reality'] = True
@@ -744,6 +1159,10 @@ class SubscriptionManager:
                     config['sni'] = sni
                 if proxy.get('skip-cert-verify') in (True, 'true', '1'):
                     config['allowInsecure'] = True
+                # uTLS fingerprint (Clash: client-fingerprint)
+                fp = proxy.get('client-fingerprint', '')
+                if fp:
+                    config['utlsFingerprint'] = fp
                 # 传输层
                 network = proxy.get('network', 'tcp')
                 config['network'] = network
@@ -781,6 +1200,47 @@ class SubscriptionManager:
                 return {
                     'name': name, 'protocol': 'hysteria2', 'address': server, 'port': port,
                     'tag': f"hy2-{_uid.uuid4().hex[:16]}", 'config': config,
+                    'subscription_id': sub_id, 'is_enabled': 1,
+                }
+
+            elif ptype == 'tuic':
+                password = proxy.get('password', '')
+                uuid_val = proxy.get('uuid', '')
+                if not password or not uuid_val:
+                    return None
+                config = {'uuid': uuid_val, 'password': password, 'tls': True}
+                sni = proxy.get('sni', proxy.get('servername', ''))
+                if sni:
+                    config['sni'] = sni
+                if proxy.get('skip-cert-verify') in (True, 'true', '1'):
+                    config['allowInsecure'] = True
+                if proxy.get('disable_sni') in (True, 'true', '1'):
+                    config['disableSni'] = True
+                # alpn：Clash 格式可能为数组或逗号分隔字符串
+                alpn_val = proxy.get('alpn', '')
+                if isinstance(alpn_val, list):
+                    alpn_val = ','.join(alpn_val)
+                if alpn_val:
+                    config['alpn'] = alpn_val
+                if proxy.get('congestion-controller'):
+                    config['congestionControl'] = proxy['congestion-controller']
+                if proxy.get('udp-relay-mode'):
+                    config['udpRelayMode'] = proxy['udp-relay-mode']
+                # heartbeat-interval（参考 NekoBox GroupUpdater.cpp:994-996）
+                heartbeat_interval = proxy.get('heartbeat-interval')
+                if heartbeat_interval:
+                    try:
+                        # Clash 格式通常为毫秒数，转换为 sing-box 时间格式
+                        ms = int(heartbeat_interval)
+                        if ms >= 1000:
+                            config['heartbeat'] = f"{ms // 1000}s"
+                        else:
+                            config['heartbeat'] = f"{ms}ms"
+                    except (ValueError, TypeError):
+                        config['heartbeat'] = str(heartbeat_interval)
+                return {
+                    'name': name, 'protocol': 'tuic', 'address': server, 'port': port,
+                    'tag': f"tuic-{_uid.uuid4().hex[:16]}", 'config': config,
                     'subscription_id': sub_id, 'is_enabled': 1,
                 }
 
@@ -883,7 +1343,7 @@ class SubscriptionManager:
                         config['sni'] = sni
                     fp = params.get('fp', [''])[0]
                     if fp:
-                        config['fingerprint'] = fp
+                        config['utlsFingerprint'] = fp
                     alpn = params.get('alpn', [''])[0]
                     if alpn:
                         config['alpn'] = alpn.split(',')
@@ -931,7 +1391,7 @@ class SubscriptionManager:
                 config['allowInsecure'] = allow_insecure == '1'
                 fp = params.get('fp', [''])[0]
                 if fp:
-                    config['fingerprint'] = fp
+                    config['utlsFingerprint'] = fp
                 # 传输层
                 transport = params.get('type', ['tcp'])[0]
                 config['network'] = transport
@@ -1043,6 +1503,53 @@ class SubscriptionManager:
                     'address': parsed.hostname or '',
                     'port': hy2_port,
                     'tag': f"hy2-{uuid.uuid4().hex[:16]}",
+                    'config': config,
+                    'subscription_id': sub_id,
+                    'is_enabled': 1,
+                }
+            elif link.startswith('tuic://'):
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(link)
+                params = parse_qs(parsed.query)
+                config = {
+                    'uuid': parsed.username or '',
+                    'password': (parsed.password or ''),
+                    'tls': True,
+                }
+                sni = params.get('sni', [''])[0]
+                if sni:
+                    config['sni'] = sni
+                # 兼容 NekoBox 下划线格式和 hyphen 格式（参考 NekoBox QUICBean.cpp:308-313）
+                allow_insecure = params.get('allow_insecure', params.get('allowInsecure', ['0']))[0]
+                config['allowInsecure'] = allow_insecure in ('1', 'true')
+                disable_sni = params.get('disable_sni', params.get('disableSni', ['0']))[0]
+                if disable_sni in ('1', 'true'):
+                    config['disableSni'] = True
+                alpn = params.get('alpn', [''])[0]
+                if alpn:
+                    config['alpn'] = alpn
+                # congestion_control：兼容下划线和连字符格式
+                congestion = params.get('congestion_control', params.get('congestion-control', ['']))[0]
+                if congestion:
+                    config['congestionControl'] = congestion
+                # udp_relay_mode：兼容下划线和连字符格式
+                udp_relay = params.get('udp_relay_mode', params.get('udp-relay-mode', ['']))[0]
+                if udp_relay:
+                    config['udpRelayMode'] = udp_relay
+                name = params.get('name', ['TUIC'])[0] or parsed.fragment or 'TUIC'
+                tuic_port = parsed.port or 0
+                if tuic_port <= 0 or tuic_port > 65535:
+                    logger.warning(f"Skipping TUIC node '{name}' with invalid port: {tuic_port}")
+                    return None
+                if not parsed.hostname:
+                    logger.warning(f"Skipping TUIC node '{name}' with empty address")
+                    return None
+                return {
+                    'name': name,
+                    'protocol': 'tuic',
+                    'address': parsed.hostname,
+                    'port': tuic_port,
+                    'tag': f"tuic-{uuid.uuid4().hex[:16]}",
                     'config': config,
                     'subscription_id': sub_id,
                     'is_enabled': 1,

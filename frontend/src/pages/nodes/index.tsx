@@ -2,17 +2,15 @@ import { useSignal } from '@preact/signals';
 import { useEffect } from 'preact/hooks';
 import { useTranslation } from '../../i18n/useTranslation';
 import { nodeStore } from '../../stores/nodeStore';
-import { proxyStore } from '../../stores/proxyStore';
 import { toastStore } from '../../stores/toastStore';
 import { callBridge } from '../../lib/api';
-import { Card } from '../../components/Card';
 import { Button } from '../../components/Button';
 import { Switch } from '../../components/Switch';
 import { Modal } from '../../components/Modal';
 import { Input } from '../../components/Input';
 import { formatLatency, formatSpeed } from '../../lib/format';
 
-const VALID_PROTOCOLS = ['vmess', 'vless', 'trojan', 'shadowsocks', 'hysteria2', 'wireguard'] as const;
+const VALID_PROTOCOLS = ['vmess', 'vless', 'trojan', 'shadowsocks', 'hysteria2', 'wireguard', 'tuic'] as const;
 
 const PROTOCOL_COLORS: Record<string, string> = {
   vmess: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
@@ -21,6 +19,7 @@ const PROTOCOL_COLORS: Record<string, string> = {
   shadowsocks: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
   hysteria2: 'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300',
   wireguard: 'bg-teal-100 text-teal-700 dark:bg-teal-900/40 dark:text-teal-300',
+  tuic: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300',
 };
 
 export function NodesPage() {
@@ -30,7 +29,7 @@ export function NodesPage() {
   const newNodeName = useSignal('');
   const newNodeAddress = useSignal('');
   const newNodePort = useSignal('443');
-  const newNodeProtocol = useSignal<'vmess' | 'vless' | 'trojan' | 'shadowsocks' | 'hysteria2' | 'wireguard'>('vmess');
+  const newNodeProtocol = useSignal<'vmess' | 'vless' | 'trojan' | 'shadowsocks' | 'hysteria2' | 'wireguard' | 'tuic'>('vmess');
   const newNodeUuid = useSignal('');
   const newNodePassword = useSignal('');
   const newNodeMethod = useSignal('aes-256-gcm');
@@ -46,6 +45,18 @@ export function NodesPage() {
   const newNodeWsPath = useSignal('/');
   const newNodeWsHost = useSignal('');
   const newNodeGrpcServiceName = useSignal('');
+  const newNodeCongestionControl = useSignal('bbr');
+  const newNodeUdpRelayMode = useSignal('native');
+  const newNodeHeartbeat = useSignal('10s');
+  const newNodeAlpn = useSignal('');
+  const newNodeDisableSni = useSignal(false);
+  const newNodeMuxEnabled = useSignal(false);
+  const newNodeMuxProtocol = useSignal('h2mux');
+  const newNodeMuxMaxStreams = useSignal('8');
+  const newNodeMuxPadding = useSignal(false);
+  const newNodeBrutalEnabled = useSignal(false);
+  const newNodeBrutalSpeed = useSignal('100');
+  const newNodeUtlsFingerprint = useSignal('');
   const editingGroup = useSignal<{id: string; name: string} | null>(null);
   const showGroupModal = useSignal(false);
   const groupModalMode = useSignal<'add' | 'rename'>('add');
@@ -55,9 +66,16 @@ export function NodesPage() {
   const deleteTargetType = useSignal<'group' | 'node'>('group');
   const newSubName = useSignal('');
   const newSubUrl = useSignal('');
-  const updatingSubId = useSignal<string | null>(null);
   const editingSubId = useSignal<string | null>(null);
+  const newSubAutoUpdate = useSignal(false);
+  const newSubUpdateInterval = useSignal('0');
+  const editingSubAutoUpdate = useSignal(false);
+  const editingSubUpdateInterval = useSignal('0');
   const selectedNodeIds = useSignal<Set<string>>(new Set());
+  // 异步操作 loading 状态 — 延迟/速度测试使用 nodeStore 全局状态（跨组件共享，信号回调清除）
+  const isBatchOperating = useSignal(false);
+  const searchQuery = useSignal('');
+  const protocolFilter = useSignal('');
 
   useEffect(() => {
     nodeStore.fetchNodes();
@@ -67,9 +85,26 @@ export function NodesPage() {
 
   const nodes = nodeStore.nodes.value;
   const groups = nodeStore.groups.value;
-  const filteredNodes = selectedGroup.value
+  const subscriptions = nodeStore.subscriptions.value;
+
+  // 多级过滤：分组 → 协议 → 搜索
+  // selectedGroup: null=未分组(无groupId), '__all__'=全部
+  let filteredNodes = selectedGroup.value === '__all__'
+    ? nodes
+    : selectedGroup.value
     ? nodes.filter(n => n.groupId === selectedGroup.value)
-    : nodes;
+    : nodes.filter(n => !n.groupId);
+  if (protocolFilter.value) {
+    filteredNodes = filteredNodes.filter(n => n.protocol === protocolFilter.value);
+  }
+  if (searchQuery.value.trim()) {
+    const q = searchQuery.value.trim().toLowerCase();
+    filteredNodes = filteredNodes.filter(n =>
+      n.name.toLowerCase().includes(q) ||
+      n.address.toLowerCase().includes(q) ||
+      n.protocol.toLowerCase().includes(q)
+    );
+  }
 
   const allFilteredIds = filteredNodes.map(n => n.id);
   const selectedCount = allFilteredIds.filter(id => selectedNodeIds.value.has(id)).length;
@@ -96,31 +131,55 @@ export function NodesPage() {
 
   const handleEnableSelected = async () => {
     const ids = [...selectedNodeIds.value];
-    for (const id of ids) { await callBridge('updateNode', id, JSON.stringify({ isEnabled: true })); }
-    selectedNodeIds.value = new Set();
-    await nodeStore.fetchNodes();
+    if (ids.length === 0) return;
+    isBatchOperating.value = true;
+    try {
+      for (const id of ids) { await callBridge('updateNode', id, JSON.stringify({ isEnabled: true })); }
+      selectedNodeIds.value = new Set();
+      await nodeStore.fetchNodes();
+    } finally {
+      isBatchOperating.value = false;
+    }
   };
 
   const handleDisableSelected = async () => {
     const ids = [...selectedNodeIds.value];
-    for (const id of ids) { await callBridge('updateNode', id, JSON.stringify({ isEnabled: false })); }
-    selectedNodeIds.value = new Set();
-    await nodeStore.fetchNodes();
+    if (ids.length === 0) return;
+    isBatchOperating.value = true;
+    try {
+      for (const id of ids) { await callBridge('updateNode', id, JSON.stringify({ isEnabled: false })); }
+      selectedNodeIds.value = new Set();
+      await nodeStore.fetchNodes();
+    } finally {
+      isBatchOperating.value = false;
+    }
   };
 
   const handleDeleteSelected = async () => {
     const ids = [...selectedNodeIds.value];
-    for (const id of ids) { await callBridge('deleteNode', id); }
-    selectedNodeIds.value = new Set();
-    await nodeStore.fetchNodes();
+    if (ids.length === 0) return;
+    isBatchOperating.value = true;
+    try {
+      for (const id of ids) { await callBridge('deleteNode', id); }
+      selectedNodeIds.value = new Set();
+      await nodeStore.fetchNodes();
+    } finally {
+      isBatchOperating.value = false;
+    }
   };
 
   const handleTestLatency = async () => {
     const tags = filteredNodes.map(n => n.tag);
     if (tags.length === 0) return;
+    // 设置全局 loading 状态，不在此处清除——由信号回调追踪完成
+    nodeStore.startLatencyTest(tags.length, false);
     toastStore.info(t('nodes.testing_group_latency', { count: tags.length }) ?? `Testing ${tags.length} nodes...`);
     const result = await callBridge('testLatency', JSON.stringify(tags));
-    if (!result.ok) toastStore.error(result.error?.message ?? t('common.error_test_latency'));
+    if (!result.ok) {
+      toastStore.error(result.error?.message ?? t('common.error_test_latency'));
+      // bridge 调用失败时立即清除（不会有后续信号）
+      nodeStore.forceFinishLatencyTest();
+    }
   };
 
   const handleAddGroup = async () => { showGroupModal.value = true; groupModalMode.value = 'add'; groupModalName.value = ''; };
@@ -205,71 +264,129 @@ export function NodesPage() {
       const cidrRegex = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,3}$/;
       if (localAddresses.length > 0 && !localAddresses.every(a => cidrRegex.test(a))) { toastStore.error(t('validation.invalid_cidr') ?? 'Invalid CIDR format'); return; }
       config = { privateKey: newNodePrivateKey.value.trim(), peerPublicKey: newNodePeerPublicKey.value.trim(), reserved: newNodeReserved.value.trim() ? newNodeReserved.value.trim().split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n)) : [], localAddress: localAddresses };
+    } else if (protocol === 'tuic') {
+      if (!newNodeUuid.value.trim() || !newNodePassword.value.trim()) { toastStore.error(t('validation.required_fields')); return; }
+      config = {
+        uuid: newNodeUuid.value.trim(),
+        password: newNodePassword.value.trim(),
+        tls: true,
+        sni: newNodeSni.value.trim() || undefined,
+        congestionControl: newNodeCongestionControl.value,
+        udpRelayMode: newNodeUdpRelayMode.value,
+        heartbeat: newNodeHeartbeat.value.trim() || undefined,
+        alpn: newNodeAlpn.value.trim() || undefined,
+        disableSni: newNodeDisableSni.value || undefined,
+      };
+    }
+    // Mux/Brutal config (applies to all protocols except wireguard)
+    if (newNodeMuxEnabled.value && newNodeProtocol.value !== 'wireguard') {
+      config.muxEnabled = true;
+      config.muxProtocol = newNodeMuxProtocol.value;
+      config.muxMaxStreams = parseInt(newNodeMuxMaxStreams.value) || 8;
+      config.muxPadding = newNodeMuxPadding.value;
+      if (newNodeBrutalEnabled.value) {
+        config.brutalEnabled = true;
+        config.brutalSpeed = parseInt(newNodeBrutalSpeed.value) || 100;
+      }
+    }
+    // Per-node uTLS fingerprint (overrides global setting)
+    if (newNodeUtlsFingerprint.value) {
+      config.utlsFingerprint = newNodeUtlsFingerprint.value;
     }
     try {
       const result = await nodeStore.addNode({ name, address, port, protocol, tag: `${protocol}-${(typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 14)}`).replace(/-/g, '').slice(0, 16)}`, groupId: selectedGroup.value, config });
       if (!result.ok) { toastStore.error(result.error?.message ?? t('nodes.add_node_failed')); return; }
       showAddModal.value = false;
-      newNodeName.value = ''; newNodeAddress.value = ''; newNodePort.value = '443'; newNodeProtocol.value = 'vmess'; newNodeUuid.value = ''; newNodePassword.value = ''; newNodeMethod.value = 'aes-256-gcm'; newNodePrivateKey.value = ''; newNodePeerPublicKey.value = ''; newNodeTls.value = 'none'; newNodeSni.value = ''; newNodeRealityPublicKey.value = ''; newNodeRealityShortId.value = ''; newNodeTransport.value = 'tcp'; newNodeWsPath.value = '/'; newNodeWsHost.value = ''; newNodeGrpcServiceName.value = ''; newNodeReserved.value = ''; newNodeLocalAddress.value = '';
+      newNodeName.value = ''; newNodeAddress.value = ''; newNodePort.value = '443'; newNodeProtocol.value = 'vmess'; newNodeUuid.value = ''; newNodePassword.value = ''; newNodeMethod.value = 'aes-256-gcm'; newNodePrivateKey.value = ''; newNodePeerPublicKey.value = ''; newNodeTls.value = 'none'; newNodeSni.value = ''; newNodeRealityPublicKey.value = ''; newNodeRealityShortId.value = ''; newNodeTransport.value = 'tcp'; newNodeWsPath.value = '/'; newNodeWsHost.value = ''; newNodeGrpcServiceName.value = ''; newNodeReserved.value = ''; newNodeLocalAddress.value = ''; newNodeCongestionControl.value = 'bbr'; newNodeUdpRelayMode.value = 'native'; newNodeHeartbeat.value = '10s'; newNodeAlpn.value = ''; newNodeDisableSni.value = false; newNodeMuxEnabled.value = false; newNodeMuxProtocol.value = 'h2mux'; newNodeMuxMaxStreams.value = '8'; newNodeMuxPadding.value = false; newNodeBrutalEnabled.value = false; newNodeBrutalSpeed.value = '100'; newNodeUtlsFingerprint.value = '';
     } catch (e) { console.warn('[addNode]', e); toastStore.error(t('nodes.add_node_failed')); }
   };
 
+  // 获取当前分组下的节点数（用于侧栏显示）
+  const getNodeCountForGroup = (groupId: string | null) => {
+    if (groupId === '__all__') return nodes.length;
+    if (!groupId) return nodes.filter(n => !n.groupId).length;
+    return nodes.filter(n => n.groupId === groupId).length;
+  };
+
   return (
-    <div class="p-6 space-y-5">
-      {/* 页面标题 + 操作按钮 */}
-      <div class="flex items-center justify-between">
-        <div>
-          <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">{t('nodes.title')}</h2>
-          <p class="text-sm text-gray-500 dark:text-gray-400 mt-0.5">{filteredNodes.length} {t('nodes.nodes_count')}</p>
+    <div class="h-screen overflow-hidden flex flex-col p-6 gap-4">
+      {/* ─── 顶部工具栏（固定） ─── */}
+      <div class="flex items-center gap-3 shrink-0">
+        {/* 搜索框 */}
+        <div class="relative flex-1 max-w-md">
+          <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
+          <input
+            type="text"
+            value={searchQuery.value}
+            onInput={(e: any) => { searchQuery.value = e.target.value; }}
+            placeholder={t('nodes.search_placeholder') ?? 'Search nodes...'}
+            class="w-full pl-9 pr-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all"
+          />
         </div>
-        <div class="flex gap-2">
-          <Button variant="ghost" size="sm" onClick={handleTestLatency}>
-            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>
-            {t('nodes.test_latency')}
-          </Button>
-          <Button variant="ghost" size="sm" onClick={async () => {
-            const allTags = nodeStore.nodes.value.map(n => n.tag);
-            if (allTags.length === 0) return;
-            const result = await callBridge('testLatency', JSON.stringify(allTags));
-            if (!result.ok) toastStore.error(result.error?.message ?? t('common.error_test_latency'));
-          }}>{t('nodes.test_all_latency')}</Button>
-          <Button variant="ghost" size="sm" onClick={async () => {
-            if (!proxyStore.state.value.isRunning) { toastStore.warning(t('nodes.speed_test_proxy_required') ?? 'Start proxy before speed test'); return; }
-            const tags = filteredNodes.filter(n => n.isEnabled).map(n => n.tag);
-            if (tags.length === 0) { toastStore.info(t('nodes.no_enabled_nodes') ?? 'No enabled nodes'); return; }
-            const result = await callBridge('testSpeed', JSON.stringify(tags));
-            if (!result.ok) toastStore.error(result.error?.message ?? t('nodes.test_speed_failed') ?? 'Speed test failed');
-          }}>{t('nodes.test_speed')}</Button>
-          <Button variant="secondary" size="sm" onClick={handleAddGroup}>{t('nodes.add_group')}</Button>
-          <Button variant="primary" size="sm" onClick={() => { showAddModal.value = true; }}>
-            <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
-            {t('nodes.add_node')}
-          </Button>
-        </div>
+        {/* 协议过滤 */}
+        <select
+          value={protocolFilter.value}
+          onChange={(e: any) => { protocolFilter.value = e.target.value; }}
+          class="px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm text-gray-700 dark:text-gray-300 focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all"
+        >
+          <option value="">{t('nodes.all_protocols') ?? 'All Protocols'}</option>
+          {VALID_PROTOCOLS.map(p => <option key={p} value={p}>{p.toUpperCase()}</option>)}
+        </select>
+        <div class="flex-1" />
+        {/* 节点数 */}
+        <span class="text-sm text-gray-500 dark:text-gray-400 whitespace-nowrap">{filteredNodes.length} / {nodes.length}</span>
+        {/* 延迟测试按钮（统一：测试当前筛选的节点延迟） */}
+        <button class="p-2 rounded-lg text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700/50 transition-colors disabled:opacity-40" disabled={nodeStore.isTestingLatency.value} onClick={handleTestLatency} title={t('nodes.test_latency')}>
+          {nodeStore.isTestingLatency.value
+            ? <div class="w-4 h-4 border-2 border-gray-400 border-t-gray-700 rounded-full animate-spin" />
+            : <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>
+          }
+        </button>
+        <div class="w-px h-5 bg-gray-200 dark:bg-gray-700" />
+        <Button variant="secondary" size="sm" onClick={handleAddGroup}>{t('nodes.add_group')}</Button>
+        <Button variant="primary" size="sm" onClick={() => { showAddModal.value = true; }}>
+          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>
+          {t('nodes.add_node')}
+        </Button>
       </div>
 
-      <div class="flex gap-5">
-        {/* 分组侧栏 */}
-        <div class="w-52 shrink-0">
-          <Card>
-            <div class="space-y-0.5">
+      <div class="flex gap-4 min-h-0 flex-1">
+        {/* ─── 侧栏：分组 + 订阅（区域滚动） ─── */}
+        <div class="w-56 shrink-0 space-y-3 overflow-y-auto">
+          {/* 分组 */}
+          <div class="bg-white dark:bg-gray-800/90 rounded-xl shadow-sm ring-1 ring-gray-100 dark:ring-gray-700/50 overflow-hidden">
+            <div class="px-3 py-2.5 border-b border-gray-100 dark:border-gray-700/50">
+              <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500">{t('nodes.groups') ?? 'Groups'}</h3>
+            </div>
+            <div class="p-1.5 space-y-0.5">
               <button
-                class={`w-full text-left px-3 py-2 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
+                class={`w-full text-left px-3 py-1.5 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
+                  ${selectedGroup.value === '__all__' ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50'}`}
+                onClick={() => { selectedGroup.value = '__all__'; }}
+              >
+                <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /><rect x="14" y="14" width="7" height="7" /></svg>
+                <span class="flex-1">{t('nodes.all_nodes') ?? 'All'}</span>
+                <span class="text-xs text-gray-400 dark:text-gray-500">{getNodeCountForGroup('__all__')}</span>
+              </button>
+              <button
+                class={`w-full text-left px-3 py-1.5 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
                   ${!selectedGroup.value ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50'}`}
                 onClick={() => { selectedGroup.value = null; }}
               >
-                <svg class="w-4 h-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /><rect x="14" y="14" width="7" height="7" /></svg>
-                {t('nodes.no_group')}
+                <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="16" /></svg>
+                <span class="flex-1">{t('nodes.no_group')}</span>
+                <span class="text-xs text-gray-400 dark:text-gray-500">{getNodeCountForGroup(null)}</span>
               </button>
               {groups.map(g => (
                 <div key={g.id} class="flex items-center group">
                   <button
-                    class={`flex-1 text-left px-3 py-2 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
+                    class={`flex-1 text-left px-3 py-1.5 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
                       ${selectedGroup.value === g.id ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50'}`}
                     onClick={() => { selectedGroup.value = g.id; }}
                   >
-                    <svg class="w-4 h-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
-                    <span class="truncate">{g.name}</span>
+                    <svg class="w-3.5 h-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" /></svg>
+                    <span class="flex-1 truncate">{g.name}</span>
+                    <span class="text-xs text-gray-400 dark:text-gray-500">{getNodeCountForGroup(g.id)}</span>
                   </button>
                   <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity pr-1">
                     <button class="p-0.5 rounded text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700" onClick={() => handleRenameGroup(g.id, g.name)}>
@@ -282,69 +399,163 @@ export function NodesPage() {
                 </div>
               ))}
             </div>
-          </Card>
+          </div>
+
+          {/* 订阅 */}
+          <div class="bg-white dark:bg-gray-800/90 rounded-xl shadow-sm ring-1 ring-gray-100 dark:ring-gray-700/50 overflow-hidden">
+            <div class="px-3 py-2.5 border-b border-gray-100 dark:border-gray-700/50 flex items-center justify-between">
+              <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500">{t('nodes.subscriptions')}</h3>
+            </div>
+            <div class="p-1.5 space-y-0.5">
+              {subscriptions.length === 0 ? (
+                <p class="text-xs text-gray-400 dark:text-gray-500 text-center py-3">{t('nodes.no_subscriptions')}</p>
+              ) : subscriptions.map(sub => (
+                <div key={sub.id} class="flex items-center group px-2 py-1.5 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors">
+                  <div class="flex-1 min-w-0">
+                    <p class="text-sm text-gray-700 dark:text-gray-300 truncate">{sub.name}</p>
+                    <p class="text-[10px] text-gray-400 dark:text-gray-500">
+                      {sub.nodeCount ?? 0} {t('nodes.nodes_count')}
+                      {sub.autoUpdate && <span class="ml-1 text-green-500">Auto</span>}
+                    </p>
+                  </div>
+                  <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button class="p-1 rounded text-gray-400 hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/20" disabled={nodeStore.updatingSubId.value === sub.id} onClick={async () => {
+                      nodeStore.startSubUpdate(sub.id);
+                      const result = await callBridge('updateSubscription', sub.id);
+                      if (!result.ok) { toastStore.error(result.error?.message ?? t('nodes.subscription_update_failed')); nodeStore.finishSubUpdate(); }
+                    }} title={t('nodes.refresh_subscription')}>
+                      {nodeStore.updatingSubId.value === sub.id
+                        ? <div class="w-3 h-3 border-2 border-gray-400 border-t-green-600 rounded-full animate-spin" />
+                        : <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10" /><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" /></svg>
+                      }
+                    </button>
+                    <button class="p-1 rounded text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700" onClick={() => { editingSubId.value = sub.id; newSubName.value = sub.name; newSubUrl.value = sub.url; editingSubAutoUpdate.value = !!sub.autoUpdate; editingSubUpdateInterval.value = String(sub.updateInterval ?? 0); }} title="Edit">
+                      <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
+                    </button>
+                    <button class="p-1 rounded text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20" onClick={async () => {
+                      const result = await callBridge('deleteSubscription', sub.id);
+                      if (result.ok) { await nodeStore.fetchSubscriptions(); await nodeStore.fetchNodes(); }
+                      else toastStore.error(result.error?.message ?? t('common.operation_failed'));
+                    }} title={t('action.delete')}>
+                      <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {/* 添加/编辑订阅表单 */}
+              <div class="pt-1.5 mt-1 border-t border-gray-100 dark:border-gray-700/50 space-y-1.5">
+                <input value={newSubName.value} onInput={(e: any) => { newSubName.value = e.target.value; }} placeholder={t('nodes.subscription_name')} class="w-full px-2.5 py-1.5 text-xs rounded-md border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:ring-1 focus:ring-green-500/30 focus:border-green-500" />
+                <input value={newSubUrl.value} onInput={(e: any) => { newSubUrl.value = e.target.value; }} placeholder={t('nodes.subscription_url')} class="w-full px-2.5 py-1.5 text-xs rounded-md border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:ring-1 focus:ring-green-500/30 focus:border-green-500" />
+                <div class="flex items-center gap-2">
+                  <label class="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400 cursor-pointer">
+                    <input type="checkbox" checked={editingSubId.value ? editingSubAutoUpdate.value : newSubAutoUpdate.value} onChange={(e: any) => { if (editingSubId.value) editingSubAutoUpdate.value = e.target.checked; else newSubAutoUpdate.value = e.target.checked; }} class="h-3 w-3 rounded border-gray-300 text-green-600 dark:border-gray-600 dark:bg-gray-700" />
+                    {t('nodes.auto_update')}
+                  </label>
+                </div>
+                <div class="flex gap-1.5">
+                  {editingSubId.value && (
+                    <button class="px-2 py-1 text-xs rounded-md text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700" onClick={() => { editingSubId.value = null; newSubName.value = ''; newSubUrl.value = ''; newSubAutoUpdate.value = false; newSubUpdateInterval.value = '0'; }}>{t('action.cancel')}</button>
+                  )}
+                  <button class="flex-1 px-2 py-1 text-xs rounded-md bg-green-600 hover:bg-green-700 text-white font-medium transition-colors disabled:opacity-40" onClick={async () => {
+                    const name = newSubName.value.trim();
+                    const url = newSubUrl.value.trim();
+                    if (!name || !url) { toastStore.error(t('validation.required_fields')); return; }
+                    if (editingSubId.value) {
+                      const autoUpdate = editingSubAutoUpdate.value;
+                      const updateInterval = parseInt(editingSubUpdateInterval.value) || 0;
+                      const result = await callBridge('updateSubscriptionMeta', editingSubId.value, JSON.stringify({ name, url, autoUpdate, updateInterval }));
+                      if (result.ok) { editingSubId.value = null; newSubName.value = ''; newSubUrl.value = ''; newSubAutoUpdate.value = false; newSubUpdateInterval.value = '0'; await nodeStore.fetchSubscriptions(); }
+                      else { toastStore.error(result.error?.message ?? t('nodes.subscription_update_failed')); }
+                    } else {
+                      const result = await callBridge('addSubscription', name, url);
+                      if (result.ok) {
+                        const autoUpdate = newSubAutoUpdate.value;
+                        const updateInterval = parseInt(newSubUpdateInterval.value) || 0;
+                        if (autoUpdate || updateInterval > 0) {
+                          const subResult = await callBridge('listSubscriptions');
+                          if (subResult.ok && subResult.data) {
+                            const newSub = (subResult.data as any[]).find((s: any) => s.name === name && s.url === url);
+                            if (newSub) { await callBridge('updateSubscriptionMeta', newSub.id, JSON.stringify({ autoUpdate, updateInterval })); }
+                          }
+                        }
+                        newSubName.value = ''; newSubUrl.value = ''; newSubAutoUpdate.value = false; newSubUpdateInterval.value = '0';
+                        await nodeStore.fetchSubscriptions();
+                      }
+                      else toastStore.error(result.error?.message ?? t('nodes.subscription_update_failed'));
+                    }
+                  }}>{editingSubId.value ? t('action.save') : t('nodes.add_subscription')}</button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
 
-        {/* 节点列表 */}
-        <div class="flex-1">
-          <Card>
+        {/* ─── 节点列表（区域滚动） ─── */}
+        <div class="flex-1 min-w-0 overflow-y-auto">
+          <div class="bg-white dark:bg-gray-800/90 rounded-xl shadow-sm ring-1 ring-gray-100 dark:ring-gray-700/50 overflow-hidden">
             {nodeStore.loading.value ? (
-              <div class="text-center py-8 text-gray-500 dark:text-gray-400">{t('common.loading')}</div>
+              <div class="text-center py-12 text-gray-500 dark:text-gray-400">
+                <div class="w-6 h-6 border-2 border-gray-300 border-t-green-600 rounded-full animate-spin mx-auto mb-3" />
+                {t('common.loading')}
+              </div>
             ) : filteredNodes.length === 0 ? (
-              <div class="text-center py-12">
-                <svg class="w-12 h-12 mx-auto text-gray-300 dark:text-gray-600 mb-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10" /><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" /></svg>
-                <p class="text-gray-400 dark:text-gray-500 text-sm">{t('nodes.no_nodes')}</p>
+              <div class="text-center py-16">
+                <svg class="w-14 h-14 mx-auto text-gray-200 dark:text-gray-700 mb-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><circle cx="12" cy="12" r="10" /><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" /></svg>
+                <p class="text-gray-400 dark:text-gray-500 text-sm">
+                  {searchQuery.value || protocolFilter.value ? (t('nodes.no_matching_nodes') ?? 'No matching nodes') : t('nodes.no_nodes')}
+                </p>
               </div>
             ) : (
-              <div class="space-y-1.5">
+              <div>
                 {/* 全选栏 */}
-                <div class="flex items-center gap-3 px-3 py-2 rounded-lg bg-gray-50 dark:bg-gray-700/30 border border-gray-100 dark:border-gray-700/50">
+                <div class="flex items-center gap-3 px-4 py-2.5 border-b border-gray-100 dark:border-gray-700/50 bg-gray-50/50 dark:bg-gray-800/50">
                   <input type="checkbox" checked={isAllSelected} ref={(el) => { if (el) el.indeterminate = isIndeterminate; }} onChange={handleToggleSelectAll} class="h-4 w-4 rounded border-gray-300 text-green-600 focus:ring-green-500 dark:border-gray-600 dark:bg-gray-700 cursor-pointer" />
-                  <span class="text-sm text-gray-600 dark:text-gray-300">{t('nodes.select_all')}</span>
+                  <span class="text-xs text-gray-500 dark:text-gray-400">{t('nodes.select_all')}</span>
+                  {selectedNodeIds.value.size > 0 && (
+                    <>
+                      <div class="w-px h-4 bg-gray-200 dark:bg-gray-700" />
+                      <span class="text-xs text-green-600 dark:text-green-400 font-medium">{selectedNodeIds.value.size} selected</span>
+                      <div class="flex gap-1">
+                        <button class="px-2 py-0.5 text-xs rounded bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 hover:bg-green-100 dark:hover:bg-green-900/30 disabled:opacity-40 transition-colors" disabled={isBatchOperating.value} onClick={handleEnableSelected}>{t('nodes.enable_selected')}</button>
+                        <button class="px-2 py-0.5 text-xs rounded bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 disabled:opacity-40 transition-colors" disabled={isBatchOperating.value} onClick={handleDisableSelected}>{t('nodes.disable_selected')}</button>
+                        <button class="px-2 py-0.5 text-xs rounded bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/30 disabled:opacity-40 transition-colors" disabled={isBatchOperating.value} onClick={handleDeleteSelected}>{t('nodes.delete_selected')}</button>
+                        <button class="px-2 py-0.5 text-xs rounded text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors" onClick={() => { selectedNodeIds.value = new Set(); }}>✕</button>
+                      </div>
+                    </>
+                  )}
                 </div>
 
-                {/* 批量操作工具栏 */}
-                {selectedNodeIds.value.size > 0 && (
-                  <div class="flex items-center gap-2 px-3 py-2 bg-green-50 dark:bg-green-900/20 rounded-lg border border-green-100 dark:border-green-800/30 animate-fade-in">
-                    <span class="text-sm text-green-700 dark:text-green-300 font-medium">{selectedNodeIds.value.size} selected</span>
-                    <div class="w-px h-4 bg-green-200 dark:bg-green-800" />
-                    <Button variant="ghost" size="sm" onClick={handleEnableSelected}>{t('nodes.enable_selected')}</Button>
-                    <Button variant="ghost" size="sm" onClick={handleDisableSelected}>{t('nodes.disable_selected')}</Button>
-                    <Button variant="ghost" size="sm" onClick={handleDeleteSelected}>{t('nodes.delete_selected')}</Button>
-                    <Button variant="ghost" size="sm" onClick={() => { selectedNodeIds.value = new Set(); }}>{t('action.cancel')}</Button>
-                  </div>
-                )}
-
-                {filteredNodes.map(node => (
-                  <div key={node.id} class={`flex items-center justify-between px-3.5 py-2.5 rounded-xl transition-all duration-150 group
-                    ${node.isEnabled
-                      ? 'bg-gray-50 dark:bg-gray-700/30 hover:bg-gray-100 dark:hover:bg-gray-700/50 border border-gray-100 dark:border-gray-700/50'
-                      : 'hover:bg-gray-50 dark:hover:bg-gray-700/20 border border-transparent opacity-60'}`}>
-                    <div class="flex items-center gap-3">
-                      <input type="checkbox" checked={selectedNodeIds.value.has(node.id)} onChange={() => handleToggleSelectNode(node.id)} class="h-4 w-4 rounded border-gray-300 text-green-600 focus:ring-green-500 dark:border-gray-600 dark:bg-gray-700 cursor-pointer" />
+                {/* 节点行列表 */}
+                <div class="divide-y divide-gray-50 dark:divide-gray-700/30">
+                  {filteredNodes.map(node => (
+                    <div key={node.id} class={`flex items-center gap-3 px-4 py-2.5 transition-all duration-150 group
+                      ${node.isEnabled
+                        ? 'hover:bg-gray-50 dark:hover:bg-gray-700/20'
+                        : 'opacity-50 hover:opacity-75'}`}>
+                      <input type="checkbox" checked={selectedNodeIds.value.has(node.id)} onChange={() => handleToggleSelectNode(node.id)} class="h-3.5 w-3.5 rounded border-gray-300 text-green-600 focus:ring-green-500 dark:border-gray-600 dark:bg-gray-700 cursor-pointer shrink-0" />
                       <Switch checked={node.isEnabled} onChange={(v) => handleToggleNode(node.id, v)} />
-                      <div>
+                      <div class="flex-1 min-w-0">
                         <div class="flex items-center gap-2">
-                          <p class="font-medium text-sm text-gray-900 dark:text-gray-100">{node.name}</p>
-                          <span class={`px-1.5 py-0.5 text-[10px] rounded-md font-semibold uppercase ${PROTOCOL_COLORS[node.protocol] || 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'}`}>{node.protocol}</span>
+                          <p class="font-medium text-sm text-gray-900 dark:text-gray-100 truncate">{node.name}</p>
+                          <span class={`shrink-0 px-1.5 py-0.5 text-[10px] rounded font-semibold uppercase ${PROTOCOL_COLORS[node.protocol] || 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'}`}>{node.protocol}</span>
                         </div>
-                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5 font-mono">{node.address}:{node.port}</p>
+                        <p class="text-xs text-gray-400 dark:text-gray-500 mt-0.5 font-mono truncate">{node.address}:{node.port}</p>
+                      </div>
+                      <div class="flex items-center gap-2.5 shrink-0">
+                        <span class={`text-xs font-medium ${node.latency != null && node.latency >= 0 ? (node.latency < 200 ? 'text-green-600 dark:text-green-400' : node.latency < 500 ? 'text-amber-600 dark:text-amber-400' : 'text-red-500 dark:text-red-400') : 'text-gray-400 dark:text-gray-500'}`}>{formatLatency(node.latency)}</span>
+                        {node.speed != null && node.speed > 0 && (
+                          <span class="text-xs text-green-600 dark:text-green-400 font-medium">{formatSpeed(node.speed)}</span>
+                        )}
+                        <button class="p-1 rounded text-gray-300 hover:text-red-500 dark:text-gray-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 opacity-0 group-hover:opacity-100 transition-all" onClick={() => handleDeleteNode(node.id)}>
+                          <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
+                        </button>
                       </div>
                     </div>
-                    <div class="flex items-center gap-3">
-                      <span class="text-xs text-gray-500 dark:text-gray-400">{formatLatency(node.latency)}</span>
-                      {node.speed != null && node.speed > 0 && (
-                        <span class="text-xs text-green-600 dark:text-green-400 font-medium">{formatSpeed(node.speed)}</span>
-                      )}
-                      <button class="p-1 rounded text-gray-300 hover:text-red-500 dark:text-gray-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 opacity-0 group-hover:opacity-100 transition-all" onClick={() => handleDeleteNode(node.id)}>
-                        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
-                      </button>
-                    </div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
             )}
-          </Card>
+          </div>
         </div>
       </div>
 
@@ -467,6 +678,107 @@ export function NodesPage() {
               </div>
             </div>
           )}
+          {newNodeProtocol.value === 'tuic' && (
+            <div class="space-y-3">
+              <div>
+                <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.uuid')}</label>
+                <Input value={newNodeUuid.value} onInput={(e: any) => { newNodeUuid.value = e.target.value; }} placeholder="UUID" />
+              </div>
+              <div>
+                <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.password')}</label>
+                <Input value={newNodePassword.value} onInput={(e: any) => { newNodePassword.value = e.target.value; }} placeholder="Password" />
+              </div>
+              <div>
+                <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.sni')}</label>
+                <Input value={newNodeSni.value} onInput={(e: any) => { newNodeSni.value = e.target.value; }} placeholder="SNI" />
+              </div>
+              <div class="flex items-center gap-2">
+                <Switch checked={newNodeDisableSni.value} onChange={(v: boolean) => { newNodeDisableSni.value = v; }} />
+                <label class="text-sm text-gray-700 dark:text-gray-300">{t('nodes.disable_sni') ?? 'Disable SNI'}</label>
+              </div>
+              <div>
+                <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.congestion_control')}</label>
+                <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={newNodeCongestionControl.value} onChange={(e: any) => { newNodeCongestionControl.value = e.target.value; }}>
+                  <option value="cubic">cubic</option>
+                  <option value="new_reno">new_reno</option>
+                  <option value="bbr">bbr</option>
+                </select>
+              </div>
+              <div>
+                <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.udp_relay_mode')}</label>
+                <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={newNodeUdpRelayMode.value} onChange={(e: any) => { newNodeUdpRelayMode.value = e.target.value; }}>
+                  <option value="native">native</option>
+                  <option value="quic">quic</option>
+                </select>
+              </div>
+              <div>
+                <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">ALPN</label>
+                <Input value={newNodeAlpn.value} onInput={(e: any) => { newNodeAlpn.value = e.target.value; }} placeholder="h3 (comma-separated, optional)" />
+              </div>
+              <div>
+                <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.heartbeat') ?? 'Heartbeat'}</label>
+                <Input value={newNodeHeartbeat.value} onInput={(e: any) => { newNodeHeartbeat.value = e.target.value; }} placeholder="10s" />
+              </div>
+            </div>
+          )}
+          {/* Mux / Brutal (all protocols except wireguard) */}
+          {newNodeProtocol.value !== 'wireguard' && (
+            <div class="space-y-3 pt-3 border-t border-gray-100 dark:border-gray-700/50">
+              <div class="flex items-center gap-2">
+                <Switch checked={newNodeMuxEnabled.value} onChange={(v: boolean) => { newNodeMuxEnabled.value = v; }} />
+                <label class="text-sm font-medium text-gray-700 dark:text-gray-300">{t('nodes.mux')}</label>
+              </div>
+              {newNodeMuxEnabled.value && (
+                <div class="space-y-3 pl-4 border-l-2 border-green-200 dark:border-green-800/40">
+                  <div>
+                    <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.mux_protocol')}</label>
+                    <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={newNodeMuxProtocol.value} onChange={(e: any) => { newNodeMuxProtocol.value = e.target.value; }}>
+                      <option value="h2mux">h2mux</option>
+                      <option value="smux">smux</option>
+                      <option value="yamux">yamux</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.mux_max_streams')}</label>
+                    <Input value={newNodeMuxMaxStreams.value} onInput={(e: any) => { newNodeMuxMaxStreams.value = e.target.value; }} placeholder="8" />
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <Switch checked={newNodeMuxPadding.value} onChange={(v: boolean) => { newNodeMuxPadding.value = v; }} />
+                    <label class="text-sm text-gray-700 dark:text-gray-300">{t('nodes.mux_padding')}</label>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <Switch checked={newNodeBrutalEnabled.value} onChange={(v: boolean) => { newNodeBrutalEnabled.value = v; }} />
+                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300">{t('nodes.brutal')}</label>
+                  </div>
+                  {newNodeBrutalEnabled.value && (
+                    <div>
+                      <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.brutal_speed')}</label>
+                      <Input value={newNodeBrutalSpeed.value} onInput={(e: any) => { newNodeBrutalSpeed.value = e.target.value; }} placeholder="100" />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          {/* Per-node uTLS fingerprint */}
+          {(newNodeProtocol.value === 'vmess' || newNodeProtocol.value === 'vless' || newNodeProtocol.value === 'trojan' || newNodeProtocol.value === 'hysteria2' || newNodeProtocol.value === 'tuic') && (
+            <div class="space-y-3 pt-3 border-t border-gray-100 dark:border-gray-700/50">
+              <div>
+                <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('nodes.utls_fingerprint')}</label>
+                <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={newNodeUtlsFingerprint.value} onChange={(e: any) => { newNodeUtlsFingerprint.value = e.target.value; }}>
+                  <option value="">{t('settings.utls_fingerprint_auto')}</option>
+                  <option value="chrome">chrome</option>
+                  <option value="firefox">firefox</option>
+                  <option value="edge">edge</option>
+                  <option value="safari">safari</option>
+                  <option value="ios">ios</option>
+                  <option value="android">android</option>
+                  <option value="random">random</option>
+                  <option value="randomized">randomized</option>
+                </select>
+              </div>
+            </div>
+          )}
         </div>
       </Modal>
 
@@ -485,70 +797,6 @@ export function NodesPage() {
           <p class="text-sm text-red-700 dark:text-red-300">{deleteTargetType.value === 'group' ? t('nodes.confirm_delete_group') : t('nodes.confirm_delete_node')}</p>
         </div>
       </Modal>
-
-      {/* 订阅管理 */}
-      <Card title={t('nodes.subscriptions')}>
-        <div class="space-y-3">
-          {nodeStore.subscriptions.value.length === 0 ? (
-            <div class="text-center py-6">
-              <svg class="w-10 h-10 mx-auto text-gray-300 dark:text-gray-600 mb-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" /><polyline points="22,6 12,13 2,6" /></svg>
-              <p class="text-gray-400 dark:text-gray-500 text-sm">{t('nodes.no_subscriptions')}</p>
-            </div>
-          ) : (
-            <div class="space-y-1.5">
-              {nodeStore.subscriptions.value.map(sub => (
-                <div key={sub.id} class="flex items-center justify-between px-3.5 py-2.5 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors group border border-transparent hover:border-gray-100 dark:hover:border-gray-700/50">
-                  <div>
-                    <p class="font-medium text-sm text-gray-900 dark:text-gray-100">{sub.name}</p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                      {sub.nodeCount ?? 0} {t('nodes.nodes_count')} · {sub.lastUpdate ? new Date(sub.lastUpdate).toLocaleDateString() : t('nodes.never_updated')}
-                      {sub.autoUpdate && <span class="ml-1.5 text-green-500 dark:text-green-400">Auto</span>}
-                    </p>
-                  </div>
-                  <div class="flex items-center gap-2">
-                    <Button variant="secondary" size="sm" disabled={updatingSubId.value === sub.id} onClick={async () => {
-                      updatingSubId.value = sub.id;
-                      try { const result = await callBridge('updateSubscription', sub.id); if (!result.ok) toastStore.error(result.error?.message ?? t('nodes.subscription_update_failed')); }
-                      finally { updatingSubId.value = null; }
-                    }}>{updatingSubId.value === sub.id ? '...' : t('nodes.refresh_subscription')}</Button>
-                    <button class="p-1 rounded text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 opacity-0 group-hover:opacity-100 transition-all" onClick={() => { editingSubId.value = sub.id; newSubName.value = sub.name; newSubUrl.value = sub.url; }}>
-                      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
-                    </button>
-                    <button class="p-1 rounded text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 opacity-0 group-hover:opacity-100 transition-all" onClick={async () => {
-                      const result = await callBridge('deleteSubscription', sub.id);
-                      if (result.ok) { await nodeStore.fetchSubscriptions(); await nodeStore.fetchNodes(); }
-                      else toastStore.error(result.error?.message ?? t('common.operation_failed'));
-                    }}>
-                      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          <div class="flex gap-2 pt-2 border-t border-gray-100 dark:border-gray-700/50">
-            <Input value={newSubName.value} onInput={(e: any) => { newSubName.value = e.target.value; }} placeholder={t('nodes.subscription_name')} class="flex-1" />
-            <Input value={newSubUrl.value} onInput={(e: any) => { newSubUrl.value = e.target.value; }} placeholder={t('nodes.subscription_url')} class="flex-1" />
-            {editingSubId.value && (
-              <Button variant="ghost" size="sm" onClick={() => { editingSubId.value = null; newSubName.value = ''; newSubUrl.value = ''; }}>{t('action.cancel')}</Button>
-            )}
-            <Button variant="primary" size="sm" onClick={async () => {
-              const name = newSubName.value.trim();
-              const url = newSubUrl.value.trim();
-              if (!name || !url) { toastStore.error(t('validation.required_fields')); return; }
-              if (editingSubId.value) {
-                const result = await callBridge('updateSubscriptionMeta', editingSubId.value, JSON.stringify({ name, url }));
-                if (result.ok) { editingSubId.value = null; newSubName.value = ''; newSubUrl.value = ''; await nodeStore.fetchSubscriptions(); }
-                else { toastStore.error(result.error?.message ?? t('nodes.subscription_update_failed')); }
-              } else {
-                const result = await callBridge('addSubscription', name, url);
-                if (result.ok) { newSubName.value = ''; newSubUrl.value = ''; await nodeStore.fetchSubscriptions(); }
-                else toastStore.error(result.error?.message ?? t('nodes.subscription_update_failed'));
-              }
-            }}>{editingSubId.value ? t('action.save') : t('nodes.add_subscription')}</Button>
-          </div>
-        </div>
-      </Card>
     </div>
   );
 }

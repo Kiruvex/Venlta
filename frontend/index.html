@@ -7,7 +7,15 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <!-- QWebChannel script: loaded from Qt resources at runtime (qrc:// URL).
+       Vite cannot resolve qrc:// URLs during build, so we use an inline
+       document.write() to inject the script tag at runtime only when
+       running inside a Qt WebEngine context (window.qt exists). -->
+  <script>
+    if (typeof window.qt !== 'undefined') {
+      document.write('<script src="qrc:///qtwebchannel/qwebchannel.js"><\/script>');
+    }
+  </script>
   <script>
     // QWebChannel signal null-safety: Qt 6's QWebChannel JS library may use
     // spread syntax (...args) on null signal arguments, causing

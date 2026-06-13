@@ -11,12 +11,23 @@ import { Input } from '../../components/Input';
 
 const OUTBOUND_OPTIONS = ['proxy', 'direct', 'block', 'auto'] as const;
 const NETWORK_OPTIONS = ['', 'tcp', 'udp'] as const;
+const ACTION_OPTIONS = ['route', 'reject', 'sniff', 'resolve', 'hijack-dns'] as const;
+const REJECT_METHOD_OPTIONS = ['default', 'conn-reset'] as const;
+const RESOLVE_SERVER_OPTIONS = ['dns-remote', 'dns-direct', 'dns-local'] as const;
 
 const OUTBOUND_COLORS: Record<string, string> = {
   proxy: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
   direct: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
   block: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
   auto: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+};
+
+const ACTION_COLORS: Record<string, string> = {
+  route: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
+  reject: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+  sniff: 'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300',
+  resolve: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
+  'hijack-dns': 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
 };
 
 const arrToStr = (v: string[] | string | undefined): string =>
@@ -34,7 +45,10 @@ export function RulesPage() {
   const editingRuleId = useSignal('');
 
   const newRuleName = useSignal('');
+  const newRuleAction = useSignal<'route' | 'reject' | 'sniff' | 'resolve' | 'hijack-dns'>('route');
   const newRuleOutbound = useSignal('proxy');
+  const newRuleRejectMethod = useSignal<'default' | 'conn-reset'>('default');
+  const newRuleResolveServer = useSignal('dns-direct');
   const newRuleDomain = useSignal('');
   const newRuleDomainSuffix = useSignal('');
   const newRuleDomainKeyword = useSignal('');
@@ -51,7 +65,10 @@ export function RulesPage() {
   const showAddAdvanced = useSignal(false);
 
   const editRuleName = useSignal('');
+  const editRuleAction = useSignal<'route' | 'reject' | 'sniff' | 'resolve' | 'hijack-dns'>('route');
   const editRuleOutbound = useSignal('proxy');
+  const editRuleRejectMethod = useSignal<'default' | 'conn-reset'>('default');
+  const editRuleResolveServer = useSignal('dns-direct');
   const editRuleDomain = useSignal('');
   const editRuleDomainSuffix = useSignal('');
   const editRuleDomainKeyword = useSignal('');
@@ -72,6 +89,7 @@ export function RulesPage() {
   const newRuleSetTag = useSignal('');
   const newRuleSetUrl = useSignal('');
   const newRuleSetFormat = useSignal<'binary' | 'source'>('binary');
+  const newRuleSetType = useSignal<'remote' | 'local'>('remote');
 
   const fetchRules = async () => {
     const result = await callBridge<any[]>('listRules');
@@ -116,7 +134,9 @@ export function RulesPage() {
   };
 
   const resetAddFields = () => {
-    newRuleName.value = ''; newRuleOutbound.value = 'proxy'; newRuleDomain.value = '';
+    newRuleName.value = ''; newRuleAction.value = 'route'; newRuleOutbound.value = 'proxy';
+    newRuleRejectMethod.value = 'default'; newRuleResolveServer.value = 'dns-direct';
+    newRuleDomain.value = '';
     newRuleDomainSuffix.value = ''; newRuleDomainKeyword.value = ''; newRuleIpCidr.value = '';
     newRuleSourceIpCidr.value = ''; newRuleProcessName.value = ''; newRuleProcessPath.value = '';
     newRulePort.value = ''; newRuleSourcePort.value = ''; newRuleSourcePortRange.value = '';
@@ -126,13 +146,28 @@ export function RulesPage() {
 
   const handleAddRule = async () => {
     const name = newRuleName.value.trim();
-    const outboundTag = newRuleOutbound.value;
+    const action = newRuleAction.value;
     const domain = newRuleDomain.value.trim();
-    if (!outboundTag) { toastStore.error(t('validation.required_fields')); return; }
-    const ruleData: Record<string, any> = { name, outboundTag, isEnabled: true };
-    if (domain) ruleData.domain = strToArr(domain);
-    const advanced = buildAdvancedFields(newRuleDomainSuffix.value, newRuleDomainKeyword.value, newRuleIpCidr.value, newRuleSourceIpCidr.value, newRuleProcessName.value, newRuleProcessPath.value, newRulePort.value, newRuleSourcePort.value, newRuleSourcePortRange.value, newRuleNetwork.value, newRuleRuleSetId.value, newRuleInvert.value);
-    Object.assign(ruleData, advanced);
+    if (!action) { toastStore.error(t('validation.required_fields')); return; }
+    const ruleData: Record<string, any> = { name, action, isEnabled: true };
+    // route action 需要 outboundTag
+    if (action === 'route') {
+      ruleData.outboundTag = newRuleOutbound.value;
+    }
+    // reject action 可选 rejectMethod
+    if (action === 'reject' && newRuleRejectMethod.value !== 'default') {
+      ruleData.rejectMethod = newRuleRejectMethod.value;
+    }
+    // resolve action 需要 resolveServer
+    if (action === 'resolve') {
+      ruleData.resolveServer = newRuleResolveServer.value;
+    }
+    // route/reject/resolve 需要匹配条件
+    if (action === 'route' || action === 'reject' || action === 'resolve') {
+      if (domain) ruleData.domain = strToArr(domain);
+      const advanced = buildAdvancedFields(newRuleDomainSuffix.value, newRuleDomainKeyword.value, newRuleIpCidr.value, newRuleSourceIpCidr.value, newRuleProcessName.value, newRuleProcessPath.value, newRulePort.value, newRuleSourcePort.value, newRuleSourcePortRange.value, newRuleNetwork.value, newRuleRuleSetId.value, newRuleInvert.value);
+      Object.assign(ruleData, advanced);
+    }
     const result = await callBridge('addRule', JSON.stringify(ruleData));
     if (result.ok) { showAddModal.value = false; resetAddFields(); await fetchRules(); }
     else { toastStore.error(result.error?.message ?? t('rules.add_rule_failed')); }
@@ -141,7 +176,10 @@ export function RulesPage() {
   const handleEditRule = (rule: any) => {
     editingRuleId.value = rule.id;
     editRuleName.value = rule.name || '';
+    editRuleAction.value = rule.action || 'route';
     editRuleOutbound.value = rule.outboundTag || 'proxy';
+    editRuleRejectMethod.value = rule.rejectMethod || 'default';
+    editRuleResolveServer.value = rule.resolveServer || 'dns-direct';
     editRuleDomain.value = arrToStr(rule.domain);
     editRuleDomainSuffix.value = arrToStr(rule.domainSuffix);
     editRuleDomainKeyword.value = arrToStr(rule.domainKeyword);
@@ -161,12 +199,23 @@ export function RulesPage() {
 
   const handleSaveEditRule = async () => {
     const name = editRuleName.value.trim();
-    const outboundTag = editRuleOutbound.value;
+    const action = editRuleAction.value;
     const domain = editRuleDomain.value.trim();
-    const updates: Record<string, any> = { name, outboundTag };
-    if (domain) updates.domain = strToArr(domain); else updates.domain = [];
-    const advanced = buildAdvancedFields(editRuleDomainSuffix.value, editRuleDomainKeyword.value, editRuleIpCidr.value, editRuleSourceIpCidr.value, editRuleProcessName.value, editRuleProcessPath.value, editRulePort.value, editRuleSourcePort.value, editRuleSourcePortRange.value, editRuleNetwork.value, editRuleRuleSetId.value, editRuleInvert.value);
-    Object.assign(updates, advanced);
+    const updates: Record<string, any> = { name, action };
+    if (action === 'route') {
+      updates.outboundTag = editRuleOutbound.value;
+    }
+    if (action === 'reject') {
+      updates.rejectMethod = editRuleRejectMethod.value;
+    }
+    if (action === 'resolve') {
+      updates.resolveServer = editRuleResolveServer.value;
+    }
+    if (action === 'route' || action === 'reject' || action === 'resolve') {
+      if (domain) updates.domain = strToArr(domain); else updates.domain = [];
+      const advanced = buildAdvancedFields(editRuleDomainSuffix.value, editRuleDomainKeyword.value, editRuleIpCidr.value, editRuleSourceIpCidr.value, editRuleProcessName.value, editRuleProcessPath.value, editRulePort.value, editRuleSourcePort.value, editRuleSourcePortRange.value, editRuleNetwork.value, editRuleRuleSetId.value, editRuleInvert.value);
+      Object.assign(updates, advanced);
+    }
     const result = await callBridge('updateRule', editingRuleId.value, JSON.stringify(updates));
     if (result.ok) { showEditModal.value = false; await fetchRules(); }
     else { toastStore.error(result.error?.message ?? t('rules.update_rule_failed')); }
@@ -215,6 +264,66 @@ export function RulesPage() {
     );
   };
 
+  // 渲染 action 相关的配置选项（根据 action 类型动态显示）
+  const renderActionFields = (
+    action: { value: string },
+    outbound: { value: string },
+    rejectMethod: { value: string },
+    resolveServer: { value: string },
+  ) => (
+    <div class="space-y-3">
+      <div>
+        <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.action')}</label>
+        <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={action.value} onChange={(e: any) => { action.value = e.target.value; }}>
+          {ACTION_OPTIONS.map(a => <option key={a} value={a}>{t(`rules.action_${a.replace('-', '_')}`)}</option>)}
+        </select>
+      </div>
+      {/* route action: 选择出站 */}
+      {action.value === 'route' && (
+        <div>
+          <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.outbound')}</label>
+          <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={outbound.value} onChange={(e: any) => { outbound.value = e.target.value; }}>
+            {OUTBOUND_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
+          </select>
+        </div>
+      )}
+      {/* reject action: 选择拒绝方式 */}
+      {action.value === 'reject' && (
+        <div>
+          <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.reject_method')}</label>
+          <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={rejectMethod.value} onChange={(e: any) => { rejectMethod.value = e.target.value; }}>
+            {REJECT_METHOD_OPTIONS.map(m => <option key={m} value={m}>{t(`rules.reject_method_${m.replace('-', '_')}`)}</option>)}
+          </select>
+        </div>
+      )}
+      {/* resolve action: 选择 DNS 服务器 */}
+      {action.value === 'resolve' && (
+        <div>
+          <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.resolve_server')}</label>
+          <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={resolveServer.value} onChange={(e: any) => { resolveServer.value = e.target.value; }}>
+            {RESOLVE_SERVER_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+          </select>
+        </div>
+      )}
+      {/* sniff/hijack-dns action 提示信息 */}
+      {action.value === 'sniff' && (
+        <p class="text-xs text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-700/30 rounded-lg px-3 py-2">{t('rules.sniff_hint')}</p>
+      )}
+      {action.value === 'hijack-dns' && (
+        <p class="text-xs text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-700/30 rounded-lg px-3 py-2">{t('rules.hijack_dns_hint')}</p>
+      )}
+    </div>
+  );
+
+  // 获取规则在列表中显示的标签
+  const getRuleBadge = (rule: any) => {
+    const action = rule.action || 'route';
+    if (action === 'route') {
+      return { text: rule.outboundTag || 'route', cls: OUTBOUND_COLORS[rule.outboundTag] || ACTION_COLORS.route };
+    }
+    return { text: t(`rules.action_${action.replace('-', '_')}`), cls: ACTION_COLORS[action] || 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400' };
+  };
+
   return (
     <div class="p-6 space-y-5">
       <div class="flex items-center justify-between">
@@ -235,33 +344,36 @@ export function RulesPage() {
           </div>
         ) : (
           <div class="space-y-1.5">
-            {rules.value.map(rule => (
-              <div key={rule.id} class={`flex items-center justify-between px-3.5 py-2.5 rounded-xl transition-all duration-150 group
-                ${rule.isEnabled
-                  ? 'bg-gray-50 dark:bg-gray-700/30 hover:bg-gray-100 dark:hover:bg-gray-700/50 border border-gray-100 dark:border-gray-700/50'
-                  : 'hover:bg-gray-50 dark:hover:bg-gray-700/20 border border-transparent opacity-60'}`}>
-                <div class="flex items-center gap-3">
-                  <Switch checked={rule.isEnabled} onChange={(v) => handleToggle(rule.id, v)} />
-                  <div>
-                    <div class="flex items-center gap-2">
-                      <p class="font-medium text-sm text-gray-900 dark:text-gray-100">{rule.name || rule.outboundTag}</p>
-                      <span class={`px-1.5 py-0.5 text-[10px] rounded-md font-semibold uppercase ${OUTBOUND_COLORS[rule.outboundTag] || 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'}`}>{rule.outboundTag}</span>
+            {rules.value.map(rule => {
+              const badge = getRuleBadge(rule);
+              return (
+                <div key={rule.id} class={`flex items-center justify-between px-3.5 py-2.5 rounded-xl transition-all duration-150 group
+                  ${rule.isEnabled
+                    ? 'bg-gray-50 dark:bg-gray-700/30 hover:bg-gray-100 dark:hover:bg-gray-700/50 border border-gray-100 dark:border-gray-700/50'
+                    : 'hover:bg-gray-50 dark:hover:bg-gray-700/20 border border-transparent opacity-60'}`}>
+                  <div class="flex items-center gap-3">
+                    <Switch checked={rule.isEnabled} onChange={(v) => handleToggle(rule.id, v)} />
+                    <div>
+                      <div class="flex items-center gap-2">
+                        <p class="font-medium text-sm text-gray-900 dark:text-gray-100">{rule.name || badge.text}</p>
+                        <span class={`px-1.5 py-0.5 text-[10px] rounded-md font-semibold uppercase ${badge.cls}`}>{badge.text}</span>
+                      </div>
+                      {rule.domain && rule.domain.length > 0 && (
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5 truncate max-w-md">{rule.domain.join(', ')}</p>
+                      )}
                     </div>
-                    {rule.domain && rule.domain.length > 0 && (
-                      <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5 truncate max-w-md">{rule.domain.join(', ')}</p>
-                    )}
+                  </div>
+                  <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-all" onClick={() => handleEditRule(rule)}>
+                      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
+                    </button>
+                    <button class="p-1.5 rounded-lg text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all" onClick={() => handleDelete(rule.id)}>
+                      <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
+                    </button>
                   </div>
                 </div>
-                <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button class="p-1.5 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition-all" onClick={() => handleEditRule(rule)}>
-                    <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
-                  </button>
-                  <button class="p-1.5 rounded-lg text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all" onClick={() => handleDelete(rule.id)}>
-                    <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </Card>
@@ -273,21 +385,23 @@ export function RulesPage() {
             <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.rule_name')}</label>
             <Input value={newRuleName.value} onInput={(e: any) => { newRuleName.value = e.target.value; }} placeholder={t('rules.rule_name')} />
           </div>
-          <div>
-            <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.outbound')}</label>
-            <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={newRuleOutbound.value} onChange={(e: any) => { newRuleOutbound.value = e.target.value; }}>
-              {OUTBOUND_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
-            </select>
-          </div>
-          <div>
-            <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.domain')}</label>
-            <Input value={newRuleDomain.value} onInput={(e: any) => { newRuleDomain.value = e.target.value; }} placeholder="example.com, test.com" />
-          </div>
-          <button type="button" class="flex items-center gap-1.5 text-sm text-green-600 hover:text-green-700 dark:text-green-400 dark:hover:text-green-300 mt-1 font-medium" onClick={() => { showAddAdvanced.value = !showAddAdvanced.value; }}>
-            <svg class={`w-3 h-3 transition-transform ${showAddAdvanced.value ? 'rotate-90' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6" /></svg>
-            {t('rules.advanced')}
-          </button>
-          {showAddAdvanced.value && renderAdvancedFields(newRuleDomainSuffix, newRuleDomainKeyword, newRuleIpCidr, newRuleSourceIpCidr, newRuleProcessName, newRuleProcessPath, newRulePort, newRuleSourcePort, newRuleSourcePortRange, newRuleNetwork, newRuleRuleSetId, newRuleInvert)}
+          {renderActionFields(newRuleAction, newRuleOutbound, newRuleRejectMethod, newRuleResolveServer)}
+          {/* route/reject/resolve action 需要匹配条件 */}
+          {(newRuleAction.value === 'route' || newRuleAction.value === 'reject' || newRuleAction.value === 'resolve') && (
+            <div>
+              <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.domain')}</label>
+              <Input value={newRuleDomain.value} onInput={(e: any) => { newRuleDomain.value = e.target.value; }} placeholder="example.com, test.com" />
+            </div>
+          )}
+          {(newRuleAction.value === 'route' || newRuleAction.value === 'reject' || newRuleAction.value === 'resolve') && (
+            <>
+              <button type="button" class="flex items-center gap-1.5 text-sm text-green-600 hover:text-green-700 dark:text-green-400 dark:hover:text-green-300 mt-1 font-medium" onClick={() => { showAddAdvanced.value = !showAddAdvanced.value; }}>
+                <svg class={`w-3 h-3 transition-transform ${showAddAdvanced.value ? 'rotate-90' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6" /></svg>
+                {t('rules.advanced')}
+              </button>
+              {showAddAdvanced.value && renderAdvancedFields(newRuleDomainSuffix, newRuleDomainKeyword, newRuleIpCidr, newRuleSourceIpCidr, newRuleProcessName, newRuleProcessPath, newRulePort, newRuleSourcePort, newRuleSourcePortRange, newRuleNetwork, newRuleRuleSetId, newRuleInvert)}
+            </>
+          )}
         </div>
       </Modal>
 
@@ -298,21 +412,22 @@ export function RulesPage() {
             <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.rule_name')}</label>
             <Input value={editRuleName.value} onInput={(e: any) => { editRuleName.value = e.target.value; }} placeholder={t('rules.rule_name')} />
           </div>
-          <div>
-            <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.outbound')}</label>
-            <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={editRuleOutbound.value} onChange={(e: any) => { editRuleOutbound.value = e.target.value; }}>
-              {OUTBOUND_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
-            </select>
-          </div>
-          <div>
-            <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.domain')}</label>
-            <Input value={editRuleDomain.value} onInput={(e: any) => { editRuleDomain.value = e.target.value; }} placeholder="example.com, test.com" />
-          </div>
-          <button type="button" class="flex items-center gap-1.5 text-sm text-green-600 hover:text-green-700 dark:text-green-400 dark:hover:text-green-300 mt-1 font-medium" onClick={() => { showEditAdvanced.value = !showEditAdvanced.value; }}>
-            <svg class={`w-3 h-3 transition-transform ${showEditAdvanced.value ? 'rotate-90' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6" /></svg>
-            {t('rules.advanced')}
-          </button>
-          {showEditAdvanced.value && renderAdvancedFields(editRuleDomainSuffix, editRuleDomainKeyword, editRuleIpCidr, editRuleSourceIpCidr, editRuleProcessName, editRuleProcessPath, editRulePort, editRuleSourcePort, editRuleSourcePortRange, editRuleNetwork, editRuleRuleSetId, editRuleInvert)}
+          {renderActionFields(editRuleAction, editRuleOutbound, editRuleRejectMethod, editRuleResolveServer)}
+          {(editRuleAction.value === 'route' || editRuleAction.value === 'reject' || editRuleAction.value === 'resolve') && (
+            <div>
+              <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.domain')}</label>
+              <Input value={editRuleDomain.value} onInput={(e: any) => { editRuleDomain.value = e.target.value; }} placeholder="example.com, test.com" />
+            </div>
+          )}
+          {(editRuleAction.value === 'route' || editRuleAction.value === 'reject' || editRuleAction.value === 'resolve') && (
+            <>
+              <button type="button" class="flex items-center gap-1.5 text-sm text-green-600 hover:text-green-700 dark:text-green-400 dark:hover:text-green-300 mt-1 font-medium" onClick={() => { showEditAdvanced.value = !showEditAdvanced.value; }}>
+                <svg class={`w-3 h-3 transition-transform ${showEditAdvanced.value ? 'rotate-90' : ''}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6" /></svg>
+                {t('rules.advanced')}
+              </button>
+              {showEditAdvanced.value && renderAdvancedFields(editRuleDomainSuffix, editRuleDomainKeyword, editRuleIpCidr, editRuleSourceIpCidr, editRuleProcessName, editRuleProcessPath, editRulePort, editRuleSourcePort, editRuleSourcePortRange, editRuleNetwork, editRuleRuleSetId, editRuleInvert)}
+            </>
+          )}
         </div>
       </Modal>
 
@@ -359,8 +474,8 @@ export function RulesPage() {
         const tag = newRuleSetTag.value.trim();
         const url = newRuleSetUrl.value.trim();
         if (!name || !tag || !url) { toastStore.error(t('validation.required_fields')); return; }
-        const result = await callBridge('addRuleSet', JSON.stringify({ name, tag, url, format: newRuleSetFormat.value, type: 'remote' }));
-        if (result.ok) { showAddRuleSetModal.value = false; newRuleSetName.value = ''; newRuleSetTag.value = ''; newRuleSetUrl.value = ''; await fetchRuleSets(); }
+        const result = await callBridge('addRuleSet', JSON.stringify({ name, tag, url, format: newRuleSetFormat.value, type: newRuleSetType.value }));
+        if (result.ok) { showAddRuleSetModal.value = false; newRuleSetName.value = ''; newRuleSetTag.value = ''; newRuleSetUrl.value = ''; newRuleSetType.value = 'remote'; await fetchRuleSets(); }
         else { toastStore.error(result.error?.message ?? t('rules.add_rule_set_failed')); }
       }}>
         <div class="space-y-3">
@@ -373,8 +488,15 @@ export function RulesPage() {
             <Input value={newRuleSetTag.value} onInput={(e: any) => { newRuleSetTag.value = e.target.value; }} placeholder="geoip-cn" />
           </div>
           <div>
-            <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.url')}</label>
-            <Input value={newRuleSetUrl.value} onInput={(e: any) => { newRuleSetUrl.value = e.target.value; }} placeholder="https://example.com/rule-set.srs" />
+            <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.rule_set_type')}</label>
+            <select class="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 text-sm focus:ring-2 focus:ring-green-500/30 focus:border-green-500 transition-all" value={newRuleSetType.value} onChange={(e: any) => { newRuleSetType.value = e.target.value; }}>
+              <option value="remote">{t('rules.rule_set_type_remote')}</option>
+              <option value="local">{t('rules.rule_set_type_local')}</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{newRuleSetType.value === 'local' ? t('rules.rule_set_path') : t('rules.url')}</label>
+            <Input value={newRuleSetUrl.value} onInput={(e: any) => { newRuleSetUrl.value = e.target.value; }} placeholder={newRuleSetType.value === 'local' ? '/path/to/rule-set.srs' : 'https://example.com/rule-set.srs'} />
           </div>
           <div>
             <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('rules.rule_set_format')}</label>

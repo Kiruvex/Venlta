@@ -42,11 +42,19 @@ class VenltaBridge(QObject):
         self._pending_app_update = None
         self._pending_core_update = None
 
+        # 互斥锁：防止 toggleSystemProxy / toggleTun 并发执行产生竞态
+        # 例如：用户快速连续切换两个开关，两者都试图 start/stop sing-box
+        self._toggle_lock = threading.Lock()
+
         # 连接内部信号到桥接信号
         # 注意：信号连接中的 .to_json() 是必需的，因为信号直接 emit 到前端，不经过 bridge_method
         self.singbox_mgr.stateChanged.connect(
             lambda d: self.proxyStateChanged.emit(BridgeResult.success(d).to_json())
         )
+        # ★ sing-box 重启时重置统计采集器连接状态 ★
+        # TUN 模式切换或 sing-box 重启后，httpx 连接池中的 keepalive 连接失效，
+        # 需要立即重建客户端，避免流量图表长时间显示 0。
+        self.singbox_mgr.stateChanged.connect(self._on_singbox_state_changed)
         self.singbox_mgr.logEmitted.connect(
             lambda d: self.logEmitted.emit(BridgeResult.success({"log": d}).to_json())
         )
@@ -67,6 +75,19 @@ class VenltaBridge(QObject):
             self.speed_tester.speedResult.connect(
                 lambda d: self.speedResult.emit(BridgeResult.success(d).to_json())
             )
+
+    # ---------- 内部信号处理 ----------
+
+    def _on_singbox_state_changed(self, state: dict):
+        """sing-box 状态变化时重置统计采集器
+
+        当 sing-box 重启（TUN 切换、手动重启、崩溃恢复等）时，
+        StatsWorker 的 httpx 连接池中的 keepalive 连接会失效，
+        导致流量图表持续显示 0。调用 reset_on_singbox_restart() 
+        立即标记需要重建客户端。
+        """
+        if state.get("isRunning"):
+            self.stats.worker.reset_on_singbox_restart()
 
     # ---------- 代理控制 ----------
     @Slot(str, result=str)
@@ -107,12 +128,12 @@ class VenltaBridge(QObject):
                 detail=f"port={conflict['port']}, pid={conflict['pid']}, process={conflict['process']}"  # 详细信息仅记录在日志中，不暴露给前端
             )
         self.singbox_mgr.start()
-        # 启动代理时，若 TUN 未启用则自动设置系统代理，确保流量实际走代理。
-        # TUN 模式下通过虚拟网卡路由流量，无需设置系统代理。
-        # 非 TUN 模式下系统代理是流量路由的关键，不设置则代理虽启动但流量不经过代理。
+        # 系统代理与 TUN 完全独立（与 NekoBox 一致）
+        # 启动代理时，根据 system_proxy_enabled 设置决定是否设置系统代理，
+        # 不再根据 TUN 状态决定。TUN 和系统代理可以同时开启。
         # 使用 mixed inbound（同时提供 HTTP+SOCKS5），端口均为 http_port
-        tun_enabled = self.config_mgr.get_tun_enabled()
-        if not tun_enabled:
+        sys_proxy_enabled = self.db.get_setting('system_proxy_enabled', False)
+        if sys_proxy_enabled:
             http_port = self.db.get_setting('http_port', 10809)
             self.sys_proxy.set_enabled(True, port=http_port, socks_port=http_port)
         # 注意：start() 通过 QMetaObject.invokeMethod(QueuedConnection) 异步执行，
@@ -126,7 +147,13 @@ class VenltaBridge(QObject):
     @Slot(result=str)
     @bridge_method
     def stopProxy(self) -> str:
+        """停止 sing-box 并清理所有代理模式
+
+        停止 sing-box 进程，同时关闭系统代理设置。
+        TUN 设备由 sing-box 进程退出时自动销毁。
+        """
         self.singbox_mgr.stop()
+        # 停止时总是清理系统代理，避免 OS 代理指向已关闭的端口
         self.sys_proxy.set_enabled(False)
         return BridgeResult.success()
 
@@ -139,85 +166,91 @@ class VenltaBridge(QObject):
     @Slot(bool, result=str)
     @bridge_method
     def toggleTun(self, enabled: bool) -> str:
-        """Toggle TUN mode
+        """Toggle TUN mode (independent of system proxy, with mutex guard)
 
         Architecture (NekoBox-inspired): sing-box creates/destroys TUN devices natively,
         no external helper needed. TunElevator manages privilege elevation.
 
-        Elevation strategies (platform-specific, auto-selected):
-        Linux:
-          1. setcap (preferred): Grant NET_ADMIN via pkexec setcap (one-time auth)
-          2. pkexec (fallback): Start sing-box via pkexec (auth every time)
-        Windows:
-          1. admin (preferred): App already running as admin, sing-box inherits privileges
-          2. uac (fallback): Launch sing-box via ShellExecuteExW("runas") UAC elevation
-        macOS:
-          1. root (preferred): App running as root
-          2. osascript (fallback): Prompt for admin credentials via osascript
-
-        Flow:
-        1. Enabling TUN: check privileges, auto-grant if possible
-        2. Auto-grant fails: return TUN_CAPABILITY_MISSING error
-        3. Frontend can call grantTunCapability() for manual grant, then retry
-        4. Privileges sufficient: save setting, restart proxy for new config
-        5. SingboxManager.start_singbox selects correct launch method via TunElevator
+        使用互斥锁确保 toggleTun / toggleSystemProxy 不会并发执行，
+        避免竞态条件（如一个在 start() 同时另一个在 stop()）。
         """
+        if not self._toggle_lock.acquire(blocking=False):
+            return BridgeResult.fail("TOGGLE_BUSY", "Another toggle operation is in progress")
+        try:
+            return self._toggleTun_inner(enabled)
+        finally:
+            self._toggle_lock.release()
+
+    def _toggleTun_inner(self, enabled: bool) -> str:
+        """toggleTun 的实际实现（已持有互斥锁）"""
         import platform as _platform
 
         if enabled:
             # Check if we have TUN privileges
             if self.tun_elevator.needs_elevation():
                 method = self.tun_elevator.get_elevation_method()
+                logger.info(f"TUN needs elevation, method={method}")
 
                 if method == "setcap":
-                    # Linux setcap: try auto-grant (one-time pkexec auth dialog)
                     result = self.tun_elevator.check_and_grant_capability()
+                    logger.info(f"TUN setcap grant result: {result}")
                     if not result.get("ok"):
-                        # setcap failed, but pkexec fallback may work at launch time
-                        pass
+                        error = result.get("error", "Failed to grant NET_ADMIN capability")
+                        logger.error(f"TUN setcap grant failed: {error}")
+                        return BridgeResult.fail(
+                            "TUN_CAPABILITY_GRANT_FAILED",
+                            f"无法授予 TUN 权限: {error}。请手动执行: sudo setcap cap_net_admin,cap_net_raw+ep $(which sing-box)"
+                        )
                 elif method == "pkexec":
-                    # Linux pkexec: will prompt at sing-box launch time, OK to proceed
-                    pass
-                elif method == "uac":
-                    # Windows UAC: will prompt at sing-box launch time via ShellExecuteExW
-                    pass
-                elif method == "osascript":
-                    # macOS osascript: will prompt at sing-box launch time
-                    pass
+                    # pkexec will prompt at launch time, OK to proceed
+                    logger.info("TUN will use pkexec for elevation at launch time")
                 elif method == "unavailable":
-                    # No elevation method available on this platform
                     return BridgeResult.fail(
                         "TUN_CAPABILITY_MISSING",
                         self.tun_elevator.get_elevation_error_message()
                     )
+            else:
+                logger.info("TUN: no elevation needed (already has capability)")
 
         self.config_mgr.set_tun_enabled(enabled)
-        # 立即重新生成配置文件，确保 TUN inbound 反映当前设置
-        # 虽然 write_config() 已改为始终重新生成，这里显式调用确保
-        # 配置文件在重启前就已更新（避免时序问题）
         try:
             self.config_mgr.regenerate()
         except RuntimeError as e:
-            logger.warning(f"Config regeneration after TUN toggle failed: {e}")
+            # 配置重生成失败：回滚 DB 中的 tun_enabled 设置，避免状态不一致
+            # 典型场景：TUN 配置语法错误导致 sing-box check 失败，配置被回滚到非 TUN 版本
+            # 如果不回滚 DB 设置，DB 中 tun_enabled=True 但实际配置无 TUN → 下次启动仍会失败
+            logger.error(f"Config regeneration after TUN toggle failed: {e}")
+            self.config_mgr.set_tun_enabled(not enabled)  # 回滚
+            return BridgeResult.fail(
+                "CONFIG_REGENERATION_FAILED",
+                f"配置重生成失败: {e}"
+            )
 
-        # System proxy management on TUN toggle (NekoBox-inspired):
-        # TUN mode captures all traffic via virtual NIC, system proxy is redundant.
-        # When switching between TUN and non-TUN modes, we must adjust system proxy:
-        # - Enable TUN: disable system proxy (avoid double-routing and potential conflicts)
-        # - Disable TUN: re-enable system proxy (traffic must route through proxy port)
-        # This is critical: without re-enabling system proxy after disabling TUN,
-        # the proxy runs but traffic doesn't go through it.
-        if self.singbox_mgr.get_state().get("isRunning"):
-            http_port = self.db.get_setting('http_port', 10809)
-            if enabled:
-                # TUN mode: disable system proxy (TUN handles routing)
-                self.sys_proxy.set_enabled(False)
+        # 读取当前真实状态（在锁内，不会被并发修改）
+        is_running = self.singbox_mgr.get_state().get("isRunning")
+        sys_proxy_enabled = self.db.get_setting('system_proxy_enabled', False)
+
+        if enabled:
+            if is_running:
+                self.singbox_mgr.restart()
             else:
-                # Non-TUN mode: re-enable system proxy
-                self.sys_proxy.set_enabled(True, port=http_port, socks_port=http_port)
-            # Restart proxy to apply new config (TUN inbound added/removed)
-            # SingboxManager.start_singbox auto-selects launch method via TunElevator
-            self.singbox_mgr.restart()
+                self.singbox_mgr.start()
+        else:
+            if is_running:
+                if sys_proxy_enabled:
+                    self.singbox_mgr.restart()
+                else:
+                    self.singbox_mgr.stop()
+
+        self.singbox_mgr.update_cached_state(isTunEnabled=enabled)
+        if not enabled and not sys_proxy_enabled and is_running:
+            self.singbox_mgr.update_cached_state(isRunning=False)
+        if enabled and not is_running:
+            self.singbox_mgr.update_cached_state(isRunning=True)
+        self.proxyStateChanged.emit(
+            BridgeResult.success(self.singbox_mgr.get_state()).to_json()
+        )
+
         return BridgeResult.success()
 
     @Slot(result=str)
@@ -282,6 +315,74 @@ class VenltaBridge(QObject):
                 "method": actual_method,
             })
         return BridgeResult.fail("TUN_CAPABILITY_GRANT_FAILED", result.get("error", "Failed to grant capability"))
+
+    @Slot(bool, result=str)
+    @bridge_method
+    def toggleSystemProxy(self, enabled: bool) -> str:
+        """Toggle system proxy mode (independent of TUN, with mutex guard)
+
+        与 NekoBox 一致：系统代理和 TUN 是完全独立的两个模式。
+        可以同时开启 TUN 和系统代理，也可以单独开启其中任何一个。
+
+        使用互斥锁确保 toggleSystemProxy / toggleTun 不会并发执行，
+        避免竞态条件（如一个在 start() 同时另一个在 stop()）。
+        """
+        if not self._toggle_lock.acquire(blocking=False):
+            return BridgeResult.fail("TOGGLE_BUSY", "Another toggle operation is in progress")
+        try:
+            return self._toggleSystemProxy_inner(enabled)
+        finally:
+            self._toggle_lock.release()
+
+    def _toggleSystemProxy_inner(self, enabled: bool) -> str:
+        """toggleSystemProxy 的实际实现（已持有互斥锁）"""
+        self.db.update_setting('system_proxy_enabled', enabled)
+
+        # 读取当前真实状态（在锁内，不会被并发修改）
+        is_running = self.singbox_mgr.get_state().get("isRunning")
+        tun_enabled = self.config_mgr.get_tun_enabled()
+
+        if enabled:
+            if is_running:
+                http_port = self.db.get_setting('http_port', 10809)
+                self.sys_proxy.set_enabled(True, port=http_port, socks_port=http_port)
+            else:
+                # sing-box 未运行：启动 sing-box
+                # 端口冲突检测
+                ports = self.config_mgr.get_used_ports()
+                conflict = self.port_detector.check_ports(ports)
+                if conflict:
+                    # 回滚设置
+                    self.db.update_setting('system_proxy_enabled', not enabled)
+                    return BridgeResult.fail(
+                        code="PORT_IN_USE",
+                        message=f"Port {conflict['port']} is already in use by another application",
+                    )
+                self.singbox_mgr.start()
+                # sing-box 启动是异步的（QMetaObject.invokeMethod QueuedConnection），
+                # 但系统代理可以立即设置：浏览器等应用会自动重试连接，
+                # sing-box 监听端口就绪后代理即可工作。
+                # 注意：此处必须设置系统代理，否则仅启动 sing-box 而不设代理，
+                # 应用/浏览器不会将流量转发到 sing-box 的监听端口。
+                http_port = self.db.get_setting('http_port', 10809)
+                self.sys_proxy.set_enabled(True, port=http_port, socks_port=http_port)
+        else:
+            # 移除 OS 代理设置
+            self.sys_proxy.set_enabled(False)
+            # 如果 TUN 也关闭，且 sing-box 正在运行 → 停止 sing-box
+            if not tun_enabled and is_running:
+                self.singbox_mgr.stop()
+
+        self.singbox_mgr.update_cached_state(isSystemProxyEnabled=enabled)
+        if not enabled and not tun_enabled and is_running:
+            self.singbox_mgr.update_cached_state(isRunning=False)
+        if enabled and not is_running:
+            self.singbox_mgr.update_cached_state(isRunning=True)
+        self.proxyStateChanged.emit(
+            BridgeResult.success(self.singbox_mgr.get_state()).to_json()
+        )
+
+        return BridgeResult.success({"system_proxy_enabled": enabled})
 
     # ---------- 节点管理 ----------
     @Slot(result=str)
@@ -412,15 +513,19 @@ class VenltaBridge(QObject):
             return BridgeResult.fail("INVALID_URL", "Subscription URL must start with http:// or https://")
         if not parsed_url.netloc:
             return BridgeResult.fail("INVALID_URL", "Subscription URL is missing host")
-        # 注意：不在此处做 URL 可达性检查（同步 HTTP 请求会阻塞 GUI）。
-        # 可达性由 _fetch_and_parse 在后台线程中异步验证，失败时通过 subscriptionUpdated 信号通知前端。
+        # 创建订阅
         sub_id = self.db.add_subscription(name, url)
+        # ★ 自动为订阅创建同名分组 ★
+        # 每个订阅的节点归入独立分组，便于管理和筛选
+        group_id = self.db.add_node_group({'name': name})
+        # 将 group_id 关联到订阅（用于后续节点导入时自动分配分组）
+        self.db.update_subscription(sub_id, {'group_id': group_id})
         # 异步更新订阅内容，不阻塞 GUI
         # 注意：lambda 中的 .to_json() 是必需的，因为直接 emit 信号，不经过 bridge_method
         self.sub_mgr.update_async(sub_id, on_done=lambda result:
             self.subscriptionUpdated.emit(BridgeResult.success({"subId": sub_id, "result": result}).to_json())
         )
-        return BridgeResult.success({"id": sub_id, "status": "updating"})
+        return BridgeResult.success({"id": sub_id, "groupId": group_id, "status": "updating"})
 
     @Slot(str, result=str)
     @bridge_method
@@ -539,17 +644,26 @@ class VenltaBridge(QObject):
             del settings['tun_enabled']
         self.db.update_settings(settings)
         if 'system_proxy_enabled' in settings:
-            # 获取当前端口配置
-            # 使用 mixed inbound（同时提供 HTTP+SOCKS5），端口均为 http_port
+            # system_proxy_enabled 推荐通过 toggleSystemProxy() 设置，
+            # 但 setSettings() 也支持（用于批量设置等场景）。
+            # 系统代理与 TUN 完全独立，无需检查 TUN 状态。
+            # 仅在代理运行中时实际设置/恢复 OS 代理，否则仅保存设置。
             http_port = self.db.get_setting('http_port', 10809)
-            self.sys_proxy.set_enabled(settings['system_proxy_enabled'], port=http_port, socks_port=http_port)
+            if self.singbox_mgr.get_state().get("isRunning"):
+                self.sys_proxy.set_enabled(settings['system_proxy_enabled'], port=http_port, socks_port=http_port)
         # 检测端口/DNS 相关字段变更，触发配置重生成 + 代理热重载
         # 设计 §4.7.4 验收标准："DNS 修改后代理配置热重载"
         # 即：代理运行中修改端口/DNS → 重写配置文件 → 重启 sing-box 使新配置生效
         # 代理未运行时仅重写配置文件，下次启动时自动使用新配置
         config_affecting_keys = {
             'socks_port', 'http_port', 'clash_api_port', 'clash_api_secret',
-            'dns_server_1', 'dns_server_2'
+            'dns_server_1', 'dns_server_2', 'dns_strategy', 'outbound_domain_strategy',
+            'utls_fingerprint', 'underlying_dns', 'fakeip_inet4_range', 'fakeip_inet6_range',
+            'tun_stack', 'tun_mtu', 'tun_strict_route', 'tun_address', 'tun_address_6',
+            'tun_route_exclude_address', 'tun_route_include_address',
+            'enable_tun_routing', 'tun_split_proxy', 'tun_split_direct', 'tun_split_block',
+            'dns_final_out_direct', 'ntp_enabled', 'ntp_server', 'ntp_server_port', 'ntp_interval',
+            'rule_set_cdn', 'adblock_enabled', 'log_level',
         }
         if config_affecting_keys & set(settings.keys()):
             self.config_mgr.regenerate()

@@ -6,16 +6,18 @@ import httpx
 import logging
 import platform
 from datetime import datetime
+from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Slot, QThread, QMetaObject, Qt
 from core.config_manager import PROXY_SELECTOR_TAG
 from core.tun_elevator import TunElevator
+from utils.constants import get_data_dir
 
 logger = logging.getLogger(__name__)
 
 # Crash restart configuration
 MAX_CRASH_RESTART = 3
 CRASH_WINDOW_SECONDS = 60
-RESTART_BACKOFF_BASE = 2
+RESTART_BACKOFF_BASE = 3  # 基础等待秒数，3^crash_count 递增，给端口释放更多时间
 
 
 class SingboxWorker(QThread):
@@ -85,10 +87,16 @@ class SingboxWorker(QThread):
         else:
             current_mode = "route"
             current_node = None
+        # 系统代理状态从 DB 读取（与 TUN 完全独立）
+        try:
+            sys_proxy_enabled = self.config_mgr.db.get_setting('system_proxy_enabled', False)
+        except Exception:
+            sys_proxy_enabled = False
         return {
             "isRunning": is_running,
             "currentMode": current_mode,
             "isTunEnabled": self.config_mgr.get_tun_enabled(),
+            "isSystemProxyEnabled": sys_proxy_enabled,
             "currentNode": current_node,
             "currentSelectorTag": PROXY_SELECTOR_TAG,
             "restartCount": len(self._crash_times),
@@ -107,6 +115,7 @@ class SingboxWorker(QThread):
     def start_singbox(self):
         try:
             if self._is_process_running():
+                logger.info("sing-box already running, skip start")
                 return
 
             # Check crash count
@@ -117,10 +126,33 @@ class SingboxWorker(QThread):
                 self.stateChanged.emit(self.get_state())
                 return
 
+            # ★ 启动前清理残留 sing-box 进程 ★
+            # 上次崩溃后可能遗留僵尸 sing-box 进程占用端口，
+            # 导致新进程无法绑定端口而立即退出
+            self._kill_zombie_singbox_processes()
+
+            # ★ 端口可用性检查 ★
+            # 检查 mixed inbound 端口和 Clash API 端口是否可用
+            self._check_ports_available()
+
             # Generate sing-box config
-            config_path = self.config_mgr.write_config()
+            # skip_validate=True: 避免 fork 子进程（sing-box check）导致 glibc 堆损坏
+            # 主线程的 toggleTun→regenerate() 已完成验证，此处无需重复验证
+            # write_config() 内部会检查距上次 regenerate 的时间，超过 5 秒则强制验证
+            config_path = self.config_mgr.write_config(skip_validate=True)
             tun_enabled = self.config_mgr.get_tun_enabled()
             method = self.tun_elevator.get_elevation_method() if tun_enabled else "none"
+
+            logger.info(f"Starting sing-box: tun_enabled={tun_enabled}, elevation_method={method}, platform={platform.system()}")
+            if tun_enabled:
+                can_tun = self.tun_elevator.can_create_tun()
+                logger.info(f"TUN capability check: can_create_tun={can_tun}, method={method}")
+                # ★ TUN 设备清理 ★
+                # 上次 sing-box 崩溃可能遗留 TUN 虚拟网卡和路由表条目，
+                # 导致新的 sing-box 实例无法创建同名 TUN 设备而崩溃。
+                # 参考 NekoBox：CoreProcess 在停止时清理 TUN 设备，
+                # 但崩溃时无法执行清理逻辑，因此需要在启动前主动清理。
+                self._cleanup_tun_device()
 
             # Determine launch strategy based on platform and elevation method
             system = platform.system()
@@ -156,8 +188,22 @@ class SingboxWorker(QThread):
         if self._elevated:
             self.logEmitted.emit("[INFO] TUN mode: starting sing-box with elevated privileges (pkexec)")
             logger.info("Starting sing-box via pkexec for TUN mode")
+        elif tun_enabled:
+            self.logEmitted.emit("[INFO] TUN mode: starting sing-box (capability already granted)")
+            logger.info("Starting sing-box for TUN mode (no pkexec needed, capability already granted)")
+        else:
+            logger.info(f"Starting sing-box without TUN: {' '.join(cmd[:3])}...")
 
-        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # ★ 使用 close_fds=False 避免 fork+exec 回退到 fork() ★
+        # Python 3.12+ subprocess.Popen 默认使用 posix_spawn，但某些条件下
+        # （如 text=True + close_fds=True）会回退到 fork()+exec()，
+        # 在多线程 Qt 应用中可能导致 glibc 堆损坏崩溃。
+        # 设置 close_fds=False 可以确保使用 posix_spawn。
+        # 参考 NekoBox：使用 QProcess::start()（内部也是 posix_spawn），不存在此问题。
+        self.process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            close_fds=False,
+        )
         self._running = True
         self._start_log_reader()
         self._start_watchdog()
@@ -213,7 +259,10 @@ class SingboxWorker(QThread):
         The log file path is embedded in the config by ConfigManager
         when TUN mode is active on Windows.
         """
-        log_file = os.path.join(os.path.expanduser("~"), ".venlta", "sing-box.log")
+        # Backward compat: use legacy ~/.venlta if it exists, otherwise platform data dir
+        legacy_dir = Path.home() / ".venlta"
+        data_dir = legacy_dir if legacy_dir.exists() else Path(get_data_dir())
+        log_file = str(data_dir / "sing-box.log")
         self._elevated_log_file = log_file
         self._start_log_file_reader(log_file)
 
@@ -294,6 +343,13 @@ class SingboxWorker(QThread):
         self._elevated_process_info = None
         self._elevated = False
 
+        # 清理 TUN 设备（参考 NekoBox CoreProcess::onExited）
+        # 正常停止时 sing-box 会自行清理 TUN 设备，但为防止异常情况，
+        # 在停止后也执行一次清理检查
+        was_tun = self.config_mgr.get_tun_enabled() if self.config_mgr else False
+        if was_tun:
+            self._cleanup_tun_device()
+
         # Close persistent Clash API client
         if self._clash_client and not self._clash_client.is_closed:
             try:
@@ -358,12 +414,31 @@ class SingboxWorker(QThread):
         self.start_singbox()
 
     def _start_log_reader(self):
-        def read_output(pipe):
-            for line in iter(pipe.readline, ''):
+        # 收集最后的 stderr 输出（崩溃诊断用）
+        self._last_stderr_lines: list[str] = []
+
+        def read_output(pipe, is_stderr: bool = False):
+            # 二进制模式读取（close_fds=False 不兼容 text=True）
+            for line in iter(pipe.readline, b''):
                 if line:
-                    self.logEmitted.emit(line.strip())
-        t1 = threading.Thread(target=read_output, args=(self.process.stdout,), daemon=True)
-        t2 = threading.Thread(target=read_output, args=(self.process.stderr,), daemon=True)
+                    try:
+                        decoded = line.decode(errors='replace').strip()
+                    except Exception:
+                        decoded = str(line.strip())
+                    # ★ 同时输出到 Python logger，确保终端也能看到 sing-box 的输出 ★
+                    # 之前只 emit 到前端，终端看不到 sing-box 的错误信息，
+                    # 导致 sing-box 崩溃时无法从终端日志诊断原因
+                    if is_stderr:
+                        logger.warning(f"[sing-box] {decoded}")
+                        # 保留最后 20 行 stderr，崩溃时输出
+                        self._last_stderr_lines.append(decoded)
+                        if len(self._last_stderr_lines) > 20:
+                            self._last_stderr_lines.pop(0)
+                    else:
+                        logger.info(f"[sing-box] {decoded}")
+                    self.logEmitted.emit(decoded)
+        t1 = threading.Thread(target=read_output, args=(self.process.stdout, False), daemon=True)
+        t2 = threading.Thread(target=read_output, args=(self.process.stderr, True), daemon=True)
         t1.start()
         t2.start()
         self._log_threads = [t1, t2]
@@ -377,13 +452,59 @@ class SingboxWorker(QThread):
 
             if self._running:
                 # Process exited unexpectedly
+                # ★ 等待 stderr 线程读取完毕（最多 500ms）★
+                # sing-box 崩溃后 stderr 可能还有未读取的输出，
+                # 等待一小段时间确保所有错误信息都被捕获
+                time.sleep(0.5)
+
                 exit_code = self._get_process_exit_code()
+                tun_enabled = self.config_mgr.get_tun_enabled() if self.config_mgr else False
+
+                # ★ 输出崩溃前的 stderr 内容 ★
+                # 这是诊断 sing-box 崩溃原因的关键信息
+                if hasattr(self, '_last_stderr_lines') and self._last_stderr_lines:
+                    logger.error(f"sing-box crashed! Last stderr output:")
+                    for line in self._last_stderr_lines:
+                        logger.error(f"  >> {line}")
+                    # 尝试读取进程剩余的 stderr（如果还有未读取的数据）
+                    if self.process and self.process.stderr:
+                        try:
+                            remaining = self.process.stderr.read()
+                            if remaining:
+                                for line in remaining.decode(errors='replace').strip().split('\n'):
+                                    if line.strip():
+                                        logger.error(f"  >> {line.strip()}")
+                        except Exception:
+                            pass
+
                 if exit_code is not None and exit_code != 0:
                     self._crash_times.append(time.time())
-                    self.logEmitted.emit(
-                        f"[ERROR] sing-box crashed with code {exit_code}, "
+                    # SIGABRT (signal 6) → exit code -6，典型于 heap corruption
+                    # SIGSEGV (signal 11) → exit code -11，典型于 null pointer dereference
+                    signal_name = ""
+                    if exit_code == -6:
+                        signal_name = " (SIGABRT - likely heap corruption)"
+                    elif exit_code == -11:
+                        signal_name = " (SIGSEGV - segmentation fault)"
+                    elif exit_code == -134:
+                        signal_name = " (SIGABRT - abort())"
+                    crash_msg = (
+                        f"[ERROR] sing-box crashed with code {exit_code}{signal_name}, "
+                        f"TUN={'ON' if tun_enabled else 'OFF'}, "
                         f"attempting restart ({len(self._crash_times)}/{MAX_CRASH_RESTART})..."
                     )
+                    self.logEmitted.emit(crash_msg)
+                    logger.error(crash_msg)
+                    # ★ 输出配置文件路径，方便手动调试 ★
+                    if self.config_mgr and self.config_mgr.config_path:
+                        logger.error(f"Config file: {self.config_mgr.config_path} "
+                                     f"(run 'sing-box run -c {self.config_mgr.config_path}' to debug manually)")
+
+                    # TUN 模式下崩溃时清理残留 TUN 设备，防止重启后再次崩溃
+                    if tun_enabled:
+                        logger.info("TUN mode crash detected, cleaning up TUN device before restart")
+                        self._cleanup_tun_device()
+
                     # Clean up process state before restart
                     self._cleanup_dead_process()
                     from PySide6.QtCore import QMetaObject, Qt
@@ -404,6 +525,183 @@ class SingboxWorker(QThread):
         self.process = None
         self._elevated_process_info = None
         self._elevated = False
+
+    def _cleanup_tun_device(self):
+        """清理上次 sing-box 崩溃遗留的 TUN 虚拟网卡和路由表条目
+
+        当 sing-box 在 TUN 模式下崩溃（如 heap corruption、SIGABRT），
+        TUN 虚拟网卡和路由表条目不会被自动清理。如果直接重新启动 sing-box，
+        新实例尝试创建同名 TUN 设备会失败（设备已存在），导致启动失败或崩溃。
+
+        参考 NekoBox：CoreProcess::onExited() 在进程退出时清理 TUN 设备，
+        但崩溃时无法执行清理逻辑。NekoBox 的做法是在启动前检查并清理残留设备。
+
+        此方法仅在 Linux 上执行清理（Windows/macOS 由系统自动清理）。
+        """
+        if platform.system() != "Linux":
+            return
+
+        try:
+            # 从 DB 读取 TUN 接口名（与 ConfigManager 一致）
+            tun_ifname = self.config_mgr.db.get_setting("tun_interface_name")
+            if not tun_ifname:
+                logger.debug("No TUN interface name configured, skip cleanup")
+                return
+
+            # 检查 TUN 设备是否存在
+            result = subprocess.run(
+                ["ip", "link", "show", tun_ifname],
+                capture_output=True, timeout=3
+            )
+            if result.returncode != 0:
+                # 设备不存在，无需清理
+                logger.debug(f"TUN device {tun_ifname} does not exist, skip cleanup")
+                return
+
+            # TUN 设备存在（上次崩溃遗留），需要清理
+            logger.warning(f"TUN device {tun_ifname} exists (leftover from crash), cleaning up...")
+
+            # 1. 删除 TUN 设备（同时清理关联的路由表条目）
+            result = subprocess.run(
+                ["ip", "link", "del", tun_ifname],
+                capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                logger.info(f"Successfully cleaned up leftover TUN device {tun_ifname}")
+            else:
+                stderr = result.stderr.decode(errors='replace').strip()
+                logger.warning(f"Failed to delete TUN device {tun_ifname}: {stderr}")
+
+        except FileNotFoundError:
+            # ip 命令不存在（不太可能在 Linux 上）
+            logger.debug("ip command not found, skip TUN cleanup")
+        except subprocess.TimeoutExpired:
+            logger.warning("TUN cleanup timed out")
+        except Exception as e:
+            logger.warning(f"TUN cleanup error (non-fatal): {e}")
+
+    def _kill_zombie_singbox_processes(self):
+        """清理残留的 sing-box 僵尸进程
+
+        当 Venlta 崩溃或强制退出时，sing-box 子进程可能继续运行，
+        占用 mixed inbound 端口和 Clash API 端口。
+        新的 sing-box 实例无法绑定这些端口，导致启动立即失败。
+
+        此方法查找并终止所有非当前进程的 sing-box 实例。
+        """
+        system = platform.system()
+
+        # Windows: use taskkill to kill zombie sing-box processes
+        if system == "Windows":
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/F", "/IM", "sing-box.exe"],
+                    capture_output=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    logger.info("Zombie sing-box.exe processes cleaned up via taskkill")
+                else:
+                    logger.debug("No zombie sing-box.exe processes found")
+            except FileNotFoundError:
+                logger.debug("taskkill command not found, skip zombie process cleanup")
+            except subprocess.TimeoutExpired:
+                logger.warning("Zombie process check timed out")
+            except Exception as e:
+                logger.warning(f"Zombie process cleanup error (non-fatal): {e}")
+            return
+
+        if system != "Linux":
+            return
+
+        try:
+            # 使用 pkill 查找并终止 sing-box 进程
+            # --exact 精确匹配进程名，避免误杀包含 "sing-box" 的其他进程
+            # --newest 保留最新的进程（即刚启动的），仅杀旧进程
+            # 但更安全的做法是：杀掉所有 sing-box 进程，然后重新启动
+            result = subprocess.run(
+                ["pgrep", "-x", "sing-box"],
+                capture_output=True, timeout=3, close_fds=False,
+            )
+            if result.returncode != 0:
+                # 没有找到 sing-box 进程
+                return
+
+            pids = result.stdout.decode(errors='replace').strip().split('\n')
+            pids = [p.strip() for p in pids if p.strip()]
+
+            if not pids:
+                return
+
+            # 排除当前进程（如果有）
+            current_pid = str(self.process.pid) if self.process and self.process.poll() is None else None
+            zombie_pids = [p for p in pids if p != current_pid]
+
+            if not zombie_pids:
+                return
+
+            logger.warning(f"Found {len(zombie_pids)} zombie sing-box process(es): {zombie_pids}, killing...")
+
+            # 发送 SIGTERM 让进程优雅退出（仅 Unix — Windows 已在上方 return）
+            for pid in zombie_pids:
+                try:
+                    os.kill(int(pid), subprocess.signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, ValueError):
+                    pass
+
+            # 等待进程退出（最多 3 秒）
+            time.sleep(1)
+
+            # 检查是否还有存活的进程，如果有则 SIGKILL（仅 Unix）
+            for pid in zombie_pids:
+                try:
+                    os.kill(int(pid), 0)  # 检查进程是否还在
+                    # 进程还在，发送 SIGKILL
+                    logger.warning(f"Process {pid} did not exit gracefully, sending SIGKILL")
+                    os.kill(int(pid), subprocess.signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, ValueError):
+                    pass  # 进程已退出
+
+            logger.info("Zombie sing-box processes cleaned up")
+
+        except FileNotFoundError:
+            # pgrep 命令不存在
+            logger.debug("pgrep command not found, skip zombie process cleanup")
+        except subprocess.TimeoutExpired:
+            logger.warning("Zombie process check timed out")
+        except Exception as e:
+            logger.warning(f"Zombie process cleanup error (non-fatal): {e}")
+
+    def _check_ports_available(self):
+        """检查 sing-box 需要的端口是否可用
+
+        如果端口被占用，sing-box 会立即崩溃（exit code 1），
+        但不会给出有用的错误信息。提前检查可以：
+        1. 给出明确的错误提示
+        2. 避免无意义的崩溃-重启循环
+        """
+        import socket
+        ports = self.config_mgr.get_used_ports()
+        for port in ports:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                result = sock.connect_ex(('127.0.0.1', port))
+                sock.close()
+                if result == 0:
+                    # 端口被占用
+                    if platform.system() == "Windows":
+                        diag_cmd = f"netstat -ano | findstr :{port}"
+                    else:
+                        diag_cmd = f"lsof -i :{port} or fuser {port}/tcp"
+                    logger.error(f"Port {port} is already in use! sing-box cannot start. "
+                                 f"Try: {diag_cmd}")
+                    self.logEmitted.emit(
+                        f"[ERROR] Port {port} is already in use! sing-box cannot bind to it. "
+                        f"Please stop the process using port {port} or change the port in settings. "
+                        f"Diagnostic: {diag_cmd}"
+                    )
+            except Exception:
+                pass  # 检查失败不影响启动流程
 
     def _get_current_mode(self) -> str:
         try:
@@ -573,6 +871,7 @@ class SingboxManager(QObject):
             "isRunning": False,
             "currentMode": "route",
             "isTunEnabled": False,
+            "isSystemProxyEnabled": False,
             "currentNode": None,
             "currentSelectorTag": PROXY_SELECTOR_TAG,
             "restartCount": 0,
@@ -587,6 +886,16 @@ class SingboxManager(QObject):
     def get_state(self) -> dict:
         """Return cached state, no cross-thread Worker property access"""
         return self._cached_state.copy()
+
+    def update_cached_state(self, **kwargs):
+        """Update specific fields in the cached state (main-thread only).
+
+        Used by bridge methods (toggleSystemProxy, toggleTun) to immediately
+        reflect DB/config changes in the cached state before emitting
+        proxyStateChanged, avoiding the stale-cache problem where the worker
+        hasn't emitted stateChanged yet.
+        """
+        self._cached_state.update(kwargs)
 
     def start(self):
         QMetaObject.invokeMethod(self.worker, "start_singbox", Qt.QueuedConnection)

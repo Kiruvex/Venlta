@@ -97,15 +97,19 @@ class TunElevator:
             "unavailable" - no elevation method available on this platform
         """
         if self.can_create_tun():
+            logger.info("TUN elevation method: none (already has capability)")
             return "none"
 
         system = platform.system()
 
         if system == "Linux":
             # Linux: prefer setcap, fall back to pkexec
-            if shutil.which("setcap") and shutil.which("pkexec"):
+            has_setcap = shutil.which("setcap") is not None
+            has_pkexec = shutil.which("pkexec") is not None
+            logger.info(f"TUN elevation check: setcap={has_setcap}, pkexec={has_pkexec}")
+            if has_setcap and has_pkexec:
                 return "setcap"
-            if shutil.which("pkexec"):
+            if has_pkexec:
                 return "pkexec"
             logger.error("Neither setcap nor pkexec found, cannot elevate for TUN")
             return "unavailable"
@@ -136,7 +140,9 @@ class TunElevator:
 
         singbox_bin = find_singbox_binary()
         if not singbox_bin or singbox_bin == "sing-box":
-            return {"ok": False, "error": "sing-box binary not found"}
+            error = "sing-box binary not found. Please install sing-box first."
+            logger.error(f"TUN grant_capability: {error}")
+            return {"ok": False, "error": error}
 
         if not shutil.which("setcap"):
             return {"ok": False, "error": "setcap command not found. Install libcap2-bin package."}
@@ -144,11 +150,13 @@ class TunElevator:
         if not shutil.which("pkexec"):
             return {"ok": False, "error": "pkexec not found. Install polkit package."}
 
+        cmd = ["pkexec", "setcap", _TUN_CAPABILITIES, singbox_bin]
+        logger.info(f"TUN grant_capability: running {' '.join(cmd)}")
         try:
             result = subprocess.run(
-                ["pkexec", "setcap", _TUN_CAPABILITIES, singbox_bin],
-                capture_output=True, text=True, timeout=60
+                cmd, capture_output=True, text=True, timeout=60
             )
+            logger.info(f"TUN grant_capability: rc={result.returncode}, stderr='{result.stderr.strip()}'")
             if result.returncode == 0:
                 self._capability_granted = True
                 logger.info(f"Granted {_TUN_CAPABILITIES} to {singbox_bin}")
@@ -241,12 +249,12 @@ class TunElevator:
         elif method == "setcap":
             # Try to grant capability (one-time auth dialog)
             result = self.check_and_grant_capability()
-            if result.get("ok") and result.get("already_has") is not False or result.get("ok"):
-                if self.can_create_tun():
-                    # Capability granted, start normally
-                    return base_cmd
+            logger.info(f"TUN setcap grant result in get_start_cmd: {result}")
+            if result.get("ok") and self.can_create_tun():
+                # Capability granted (or already had), start normally
+                return base_cmd
             # setcap failed, fall back to pkexec start
-            logger.warning("setcap grant failed, falling back to pkexec start for TUN mode")
+            logger.warning("setcap grant failed or capability not effective, falling back to pkexec start for TUN mode")
             return ["pkexec"] + base_cmd
 
         elif method == "pkexec":
@@ -524,11 +532,13 @@ class TunElevator:
         """Check if sing-box has NET_ADMIN capability or is running as root (Linux)"""
         # Running as root
         if os.geteuid() == 0:
+            logger.info("TUN capability check: running as root, TUN available")
             return True
 
         # Check file capabilities on sing-box binary
         singbox_bin = find_singbox_binary()
         if not singbox_bin or singbox_bin == "sing-box":
+            logger.warning(f"TUN capability check: sing-box binary not found (find_singbox_binary returned '{singbox_bin}')")
             return False
 
         try:
@@ -536,10 +546,11 @@ class TunElevator:
                 ["getcap", singbox_bin],
                 capture_output=True, text=True, timeout=5
             )
+            logger.info(f"TUN capability check: getcap {singbox_bin} -> stdout='{result.stdout.strip()}' rc={result.returncode}")
             if result.returncode == 0 and "cap_net_admin" in result.stdout:
                 return True
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"TUN capability check: getcap failed: {e}")
 
         return False
 

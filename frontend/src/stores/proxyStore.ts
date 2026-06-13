@@ -5,6 +5,7 @@ export interface ProxyState {
   isRunning: boolean;
   currentMode: 'route' | 'global' | 'direct';
   isTunEnabled: boolean;
+  isSystemProxyEnabled: boolean;
   currentNode: string | null;
   currentSelectorTag: string | null;  // Clash API selector group tag（如 "proxy"），用于 switchNode
   restartCount: number;
@@ -15,6 +16,7 @@ const initialState: ProxyState = {
   isRunning: false,
   currentMode: 'route',
   isTunEnabled: false,
+  isSystemProxyEnabled: false,
   currentNode: null,
   currentSelectorTag: 'proxy',
   restartCount: 0,

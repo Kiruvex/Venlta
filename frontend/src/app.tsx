@@ -121,6 +121,8 @@ export function App() {
         if (result.ok && result.data?.results) {
           nodeStore.updateLatencyResults(result.data.results);
         }
+        // 注意：如果 result 不 ok 或没有 results，后端仍然会为每个批次发送信号，
+        // 所以计数追踪应该正常。如果没有信号到达，安全超时会兜底。
       } catch (e) { console.warn('[onLatencyResult]', e); }
     };
     try { window.bridge.latencyResult?.connect(handleLatencyResult); } catch (e) { console.warn('[signal] latencyResult connect failed:', e); }
@@ -162,7 +164,9 @@ export function App() {
             toastStore.error(result.data.result?.error ?? i18next.t('nodes.subscription_update_failed'));
           }
         }
-      } catch (e) { console.warn('[onSubscriptionUpdated]', e); }
+        // 无论成功失败，订阅更新已完成，清除 loading 状态
+        nodeStore.finishSubUpdate();
+      } catch (e) { console.warn('[onSubscriptionUpdated]', e); nodeStore.finishSubUpdate(); }
     };
     try { window.bridge.subscriptionUpdated?.connect(handleSubUpdated); } catch (e) { console.warn('[signal] subscriptionUpdated connect failed:', e); }
 
@@ -214,9 +218,23 @@ export function App() {
           {/* Brand header */}
           <div class="px-5 py-6 relative z-10">
             <div class="flex items-center gap-3">
-              <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-green-400 to-emerald-600 flex items-center justify-center shadow-lg shadow-green-500/30">
-                <svg class="w-4 h-4 text-white" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              <div class="w-8 h-8 rounded-lg overflow-hidden shadow-lg shadow-green-500/30">
+                <svg viewBox="0 0 512 512" width="100%" height="100%">
+                  <defs>
+                    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" stop-color="#0F172A"/>
+                      <stop offset="100%" stop-color="#1E293B"/>
+                    </linearGradient>
+                    <linearGradient id="planeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" stop-color="#34E89E"/>
+                      <stop offset="100%" stop-color="#0FDBF6"/>
+                    </linearGradient>
+                  </defs>
+                  <rect x="56" y="56" width="400" height="400" rx="96" fill="url(#bgGrad)" stroke="#334155" stroke-width="2"/>
+                  <path d="M256,144 L144,368 L256,320 L368,368 Z" fill="url(#planeGrad)"/>
+                  <line x1="256" y1="144" x2="256" y2="320" stroke="#FFFFFF" stroke-width="3" opacity="0.5" stroke-linecap="round"/>
+                  <line x1="256" y1="320" x2="184" y2="360" stroke="#0FDBF6" stroke-width="4" opacity="0.6" stroke-linecap="round"/>
+                  <line x1="256" y1="320" x2="328" y2="360" stroke="#34E89E" stroke-width="4" opacity="0.6" stroke-linecap="round"/>
                 </svg>
               </div>
               <div>

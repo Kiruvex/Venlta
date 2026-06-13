@@ -2,8 +2,14 @@ import platform
 import subprocess
 import logging
 import json
+from pathlib import Path
+from utils.constants import get_data_dir
 
 logger = logging.getLogger(__name__)
+
+# Windows InternetSetOption constants
+INTERNET_OPTION_SETTINGS_CHANGED = 37
+INTERNET_OPTION_REFRESH = 73
 
 
 def _get_macos_network_services() -> list[str]:
@@ -69,9 +75,20 @@ class SystemProxy:
         try:
             enabled = winreg.QueryValueEx(key, "ProxyEnable")[0]
             server = winreg.QueryValueEx(key, "ProxyServer")[0]
-            self.original_settings = ("Windows", {"enabled": enabled, "server": server})
+            try:
+                override = winreg.QueryValueEx(key, "ProxyOverride")[0]
+            except FileNotFoundError:
+                override = ""
+            try:
+                auto_config_url = winreg.QueryValueEx(key, "AutoConfigURL")[0]
+            except FileNotFoundError:
+                auto_config_url = ""
+            self.original_settings = ("Windows", {
+                "enabled": enabled, "server": server,
+                "override": override, "auto_config_url": auto_config_url,
+            })
         except FileNotFoundError:
-            self.original_settings = ("Windows", {"enabled": 0, "server": ""})
+            self.original_settings = ("Windows", {"enabled": 0, "server": "", "override": "", "auto_config_url": ""})
         finally:
             winreg.CloseKey(key)
 
@@ -81,10 +98,16 @@ class SystemProxy:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings", 0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{host}:{port}")
+        winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, "localhost;127.0.0.1;<local>")
+        # Clear any PAC auto-config URL so manual proxy takes effect
+        try:
+            winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, "")
+        except Exception:
+            pass
         winreg.CloseKey(key)
         # Notify system proxy settings change
-        ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)  # SETTINGS_CHANGED
-        ctypes.windll.wininet.InternetSetOptionW(0, 73, 0, 0)  # REFRESH
+        ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
+        ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
 
     # ---- Linux ----
     def _backup_linux(self):
@@ -163,7 +186,53 @@ class SystemProxy:
             subprocess.run(["xfconf-query", "-c", "xfce4-session", "-p", "/proxy/socks/host", "-s", host])
             subprocess.run(["xfconf-query", "-c", "xfce4-session", "-p", "/proxy/socks/port", "-s", str(socks_port)])
         else:
-            logger.warning(f"Unsupported Linux desktop: {desktop}")
+            # 不支持的桌面环境：尝试 gsettings（某些非 GNOME 桌面也使用 dconf/gsettings）
+            # gsettings 是 Linux 桌面代理设置的事实标准，许多应用（如 Firefox、Chrome）会读取
+            gsettings_ok = False
+            try:
+                result = subprocess.run(
+                    ["gsettings", "set", "org.gnome.system.proxy", "mode", "manual"],
+                    capture_output=True, timeout=3
+                )
+                if result.returncode == 0:
+                    subprocess.run(["gsettings", "set", "org.gnome.system.proxy.http", "host", host], capture_output=True, timeout=3)
+                    subprocess.run(["gsettings", "set", "org.gnome.system.proxy.http", "port", str(port)], capture_output=True, timeout=3)
+                    subprocess.run(["gsettings", "set", "org.gnome.system.proxy.https", "host", host], capture_output=True, timeout=3)
+                    subprocess.run(["gsettings", "set", "org.gnome.system.proxy.https", "port", str(port)], capture_output=True, timeout=3)
+                    subprocess.run(["gsettings", "set", "org.gnome.system.proxy.socks", "host", host], capture_output=True, timeout=3)
+                    subprocess.run(["gsettings", "set", "org.gnome.system.proxy.socks", "port", str(socks_port)], capture_output=True, timeout=3)
+                    gsettings_ok = True
+                    logger.info(f"Set system proxy via gsettings (desktop={desktop})")
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+            # 设置环境变量作为 fallback（当前进程及其子进程生效）
+            os.environ["http_proxy"] = f"http://{host}:{port}"
+            os.environ["https_proxy"] = f"http://{host}:{port}"
+            os.environ["HTTP_PROXY"] = f"http://{host}:{port}"
+            os.environ["HTTPS_PROXY"] = f"http://{host}:{port}"
+            os.environ["all_proxy"] = f"socks5://{host}:{socks_port}"
+            os.environ["ALL_PROXY"] = f"socks5://{host}:{socks_port}"
+            os.environ["no_proxy"] = "localhost,127.0.0.1,::1"
+            os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+            # 写入代理环境变量到文件，用户可在终端中 source 此文件
+            try:
+                # Backward compat: use legacy ~/.venlta if it exists, otherwise platform data dir
+                _legacy = Path.home() / ".venlta"
+                proxy_env_path = (_legacy if _legacy.exists() else Path(get_data_dir())) / "proxy.env"
+                with open(proxy_env_path, 'w') as f:
+                    f.write(f"export http_proxy=http://{host}:{port}\n")
+                    f.write(f"export https_proxy=http://{host}:{port}\n")
+                    f.write(f"export HTTP_PROXY=http://{host}:{port}\n")
+                    f.write(f"export HTTPS_PROXY=http://{host}:{port}\n")
+                    f.write(f"export all_proxy=socks5://{host}:{socks_port}\n")
+                    f.write(f"export ALL_PROXY=socks5://{host}:{socks_port}\n")
+                    f.write(f"export no_proxy=localhost,127.0.0.1,::1\n")
+                    f.write(f"export NO_PROXY=localhost,127.0.0.1,::1\n")
+                if not gsettings_ok:
+                    logger.warning(f"Unsupported Linux desktop: {desktop}. Environment variables set. "
+                                   f"Source ~/.venlta/proxy.env in your terminal for CLI apps.")
+            except Exception as e:
+                logger.debug(f"Failed to write proxy.env: {e}")
 
     # ---- macOS ----
     def _backup_macos(self):
@@ -288,9 +357,13 @@ class SystemProxy:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Internet Settings", 0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, saved["enabled"])
         winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, saved["server"])
+        if "override" in saved:
+            winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, saved["override"])
+        if "auto_config_url" in saved:
+            winreg.SetValueEx(key, "AutoConfigURL", 0, winreg.REG_SZ, saved["auto_config_url"])
         winreg.CloseKey(key)
-        ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)  # SETTINGS_CHANGED
-        ctypes.windll.wininet.InternetSetOptionW(0, 73, 0, 0)  # REFRESH
+        ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
+        ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
 
     def _restore_linux(self):
         import os
@@ -350,6 +423,18 @@ class SystemProxy:
                 subprocess.run(["xfconf-query", "-c", "xfce4-session", "-p", "/proxy/socks/host", "-s", saved["socks_host"]])
             if saved.get("socks_port"):
                 subprocess.run(["xfconf-query", "-c", "xfce4-session", "-p", "/proxy/socks/port", "-s", saved["socks_port"]])
+        # 清理环境变量和 proxy.env 文件
+        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                     "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"):
+            os.environ.pop(key, None)
+        try:
+            # Backward compat: use legacy ~/.venlta if it exists, otherwise platform data dir
+            _legacy = Path.home() / ".venlta"
+            proxy_env_path = (_legacy if _legacy.exists() else Path(get_data_dir())) / "proxy.env"
+            if proxy_env_path.exists():
+                proxy_env_path.unlink()
+        except Exception:
+            pass
 
     def _restore_macos(self):
         """Restore macOS proxy settings for all network services"""

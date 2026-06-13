@@ -1,11 +1,27 @@
 import sys
 import os
+import json
 
 # 确保 backend/ 目录在 sys.path 中，使得 from bridge.xxx / from core.xxx 等导入
 # 在 python -m backend.main 和直接 python backend/main.py 两种启动方式下都能工作
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
+
+# faulthandler: 在 C 级别崩溃时打印 Python 调用栈，便于诊断 glibc 堆损坏等问题
+# 必须在 PySide6 导入之前启用，否则崩溃时可能来不及输出
+try:
+    import faulthandler
+    faulthandler.enable()
+except ImportError:
+    pass
+
+# QtWebEngine Chromium 标志：禁用代理自动检测，防止 TUN 模式启用时
+# Chromium 代理解析代码检测到网络变化导致浏览器进程崩溃
+# 必须在 QWebEngineView 导入之前设置
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
+    "--disable-features=NetworkServiceInProcess "
+    "--no-proxy-server")
 
 from PySide6.QtWidgets import QApplication, QMainWindow
 from PySide6.QtCore import QUrl, Qt
@@ -51,25 +67,24 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         self.raise_()
 
-    def _on_tray_toggle_proxy(self, start: bool):
-        """托盘菜单触发的代理启停
+    def _on_tray_toggle_system_proxy(self, enabled: bool):
+        """托盘菜单触发的系统代理切换
 
-        与 VenltaBridge.startProxy/stopProxy 保持一致：
-        - 停止时同时关闭系统代理，避免操作系统代理仍指向已关闭的端口
-        - 启动时若 TUN 未启用则自动设置系统代理，确保流量走代理
+        通过 bridge.toggleSystemProxy() 执行，确保互斥锁保护，
+        避免与前端并发操作产生竞态条件。
         """
-        if start:
-            self.singbox_mgr.start()
-            # 若 TUN 未启用，设置系统代理确保流量路由
-            # 使用 mixed inbound（同时提供 HTTP+SOCKS5），端口均为 http_port
-            tun_enabled = self.config_mgr.get_tun_enabled()
-            if not tun_enabled:
-                http_port = self.db.get_setting('http_port', 10809)
-                self.sys_proxy.set_enabled(True, port=http_port, socks_port=http_port)
-        else:
-            self.singbox_mgr.stop()
-            # 停止代理时必须恢复系统代理设置，否则操作系统代理仍指向已关闭的端口
-            self.sys_proxy.set_enabled(False)
+        self.bridge.toggleSystemProxy(enabled)
+
+    def _on_tray_toggle_tun(self, enabled: bool):
+        """托盘菜单触发的 TUN 切换
+
+        通过 bridge.toggleTun() 执行，确保互斥锁保护。
+        """
+        self.bridge.toggleTun(enabled)
+
+    def _on_tray_restart_proxy(self):
+        """托盘菜单触发的重启代理"""
+        self.bridge.restartProxy()
 
     def _on_quit(self):
         """托盘菜单触发的退出
@@ -165,8 +180,20 @@ def main():
     if os.getenv("VENLTA_DEV"):
         url = QUrl("http://localhost:5173")
     else:
+        # 1. Nuitka 打包后：frontend/ 在可执行文件同级目录
         static_path = os.path.join(os.path.dirname(sys.executable), "frontend")
-        url = QUrl.fromLocalFile(os.path.join(static_path, "index.html"))
+        index_html = os.path.join(static_path, "index.html")
+        if not os.path.isfile(index_html):
+            # 2. 开发环境（python -m backend.main）：frontend/dist/ 在项目根目录
+            project_root = os.path.dirname(_BACKEND_DIR)
+            static_path = os.path.join(project_root, "frontend", "dist")
+            index_html = os.path.join(static_path, "index.html")
+        if not os.path.isfile(index_html):
+            # 3. 兜底：尝试 frontend/ 目录（开发服务器输出）
+            project_root = os.path.dirname(_BACKEND_DIR)
+            static_path = os.path.join(project_root, "frontend")
+            index_html = os.path.join(static_path, "index.html")
+        url = QUrl.fromLocalFile(index_html)
     webview.load(url)
 
     # 创建主窗口（集成 WebView）
@@ -184,18 +211,27 @@ def main():
         set_language(saved_language)
     tray = SystemTray(window)
     window.tray = tray
-    tray.show_window_requested.connect(window.show_and_activate)
-    tray.quit_requested.connect(window._on_quit)
-    tray.toggle_proxy_requested.connect(window._on_tray_toggle_proxy)
     tray.show()
 
-    # 代理状态变更时同步更新托盘图标
+    # 连接托盘信号到 MainWindow 的槽函数
+    tray.show_window_requested.connect(window.show_and_activate)
+    tray.quit_requested.connect(window._on_quit)
+    tray.toggle_system_proxy_requested.connect(window._on_tray_toggle_system_proxy)
+    tray.toggle_tun_requested.connect(window._on_tray_toggle_tun)
+    tray.restart_proxy_requested.connect(window._on_tray_restart_proxy)
+
+    # 代理状态变更时同步更新托盘图标（含模式信息）
     def on_proxy_state_changed(state_json: str):
         try:
             import json
             result = json.loads(state_json)
             if result.get("ok") and result.get("data"):
-                tray.set_proxy_state(result["data"].get("isRunning", False))
+                data = result["data"]
+                tray.set_proxy_state(
+                    running=data.get("isRunning", False),
+                    system_proxy_enabled=data.get("isSystemProxyEnabled", False),
+                    tun_enabled=data.get("isTunEnabled", False),
+                )
         except Exception:
             pass
     bridge.proxyStateChanged.connect(on_proxy_state_changed)
@@ -216,25 +252,30 @@ def main():
     QTimer.singleShot(5000, _startup_update_check)
 
     # Auto-start sing-box on app launch (delayed to allow UI to initialize first)
-    # sing-box always starts when the app launches if there are enabled nodes,
-    # so the user doesn't have to manually click "Start" every time.
+    # NekoBox-style logic: sing-box starts only if at least one mode is enabled
+    # (system proxy or TUN). If both are off, sing-box stays stopped until
+    # user toggles one on.
     def _startup_auto_start():
         try:
+            sys_proxy_enabled = config_mgr.db.get_setting('system_proxy_enabled', False)
+            tun_enabled = config_mgr.get_tun_enabled()
+            if not (sys_proxy_enabled or tun_enabled):
+                logger.info("Both system proxy and TUN are off, skipping auto-start")
+                return
             # Check if there are enabled nodes before starting
             nodes = db.get_all_nodes_raw()
             enabled_nodes = [n for n in nodes if n.get('is_enabled', 0)]
-            if enabled_nodes:
-                logger.info(f"Auto-starting proxy ({len(enabled_nodes)} enabled nodes)...")
-                singbox_mgr.start()
-                # 若 TUN 未启用，设置系统代理确保流量路由
-                # 使用 mixed inbound（同时提供 HTTP+SOCKS5），端口均为 http_port
-                tun_enabled = config_mgr.get_tun_enabled()
-                if not tun_enabled:
-                    http_port = db.get_setting('http_port', 10809)
-                    sys_proxy.set_enabled(True, port=http_port, socks_port=http_port)
-                logger.info("Auto-start completed successfully")
-            else:
+            if not enabled_nodes:
                 logger.info("No enabled nodes, skipping auto-start")
+                return
+            logger.info(f"Auto-starting proxy ({len(enabled_nodes)} enabled nodes, sys_proxy={sys_proxy_enabled}, tun={tun_enabled})...")
+            singbox_mgr.start()
+            # 根据 system_proxy_enabled 设置决定是否开启系统代理
+            # TUN 模式通过 sing-box 配置自动生效
+            if sys_proxy_enabled:
+                http_port = db.get_setting('http_port', 10809)
+                sys_proxy.set_enabled(True, port=http_port, socks_port=http_port)
+            logger.info("Auto-start completed successfully")
         except Exception as e:
             logger.error(f"Startup auto-start failed: {e}", exc_info=True)
             # 同步代理状态到前端，避免前端显示与实际不一致

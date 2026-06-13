@@ -6,4 +6,9 @@ export default defineConfig({
   server: {
     port: 5173,
   },
+  build: {
+    outDir: 'dist',
+    // Ensure assets use relative paths so Qt can load them from local file://
+    base: './',
+  },
 });

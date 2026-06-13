@@ -8,6 +8,7 @@ export interface VenltaBridge {
   stopProxy(): Promise<string>;
   restartProxy(): Promise<string>;
   toggleTun(enabled: boolean): Promise<string>;
+  toggleSystemProxy(enabled: boolean): Promise<string>;
   checkTunCapability(): Promise<string>;
   grantTunCapability(): Promise<string>;
   switchMode(mode: string): Promise<string>;
@@ -147,11 +148,12 @@ export async function callBridge<T>(methodName: BridgeMethodName, ...args: any[]
 
 export function createMockBridge(): VenltaBridge {
   return {
-    getProxyState: async () => JSON.stringify({ ok: true, data: { isRunning: false, currentMode: 'route', isTunEnabled: false, currentSelectorTag: 'proxy', currentNode: null, restartCount: 0, lastCrashTime: null } }),
+    getProxyState: async () => JSON.stringify({ ok: true, data: { isRunning: false, currentMode: 'route', isTunEnabled: false, isSystemProxyEnabled: false, currentSelectorTag: 'proxy', currentNode: null, restartCount: 0, lastCrashTime: null } }),
     startProxy: async () => JSON.stringify({ ok: true }),
     stopProxy: async () => JSON.stringify({ ok: true }),
     restartProxy: async () => JSON.stringify({ ok: true }),
     toggleTun: async (enabled: boolean) => JSON.stringify({ ok: true, data: { tun_enabled: enabled } }),
+    toggleSystemProxy: async (enabled: boolean) => JSON.stringify({ ok: true, data: { system_proxy_enabled: enabled } }),
     checkTunCapability: async () => JSON.stringify({ ok: true, data: { can_create_tun: false, platform: 'Linux', details: 'mock' } }),
     grantTunCapability: async () => JSON.stringify({ ok: true, data: { already_has: false } }),
     switchMode: async () => JSON.stringify({ ok: true }),

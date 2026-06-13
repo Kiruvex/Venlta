@@ -75,16 +75,29 @@ build_backend() {
     )
 
     # 平台特定参数
-    if [ "$(uname -s)" = "Windows" ]; then
-        NUITKA_ARGS+=(
-            --windows-icon-from-ico=resources/icons/venlta.ico
-            --windows-disable-console
-        )
-    elif [ "$(uname -s)" = "Linux" ]; then
-        NUITKA_ARGS+=(
-            --linux-icon=resources/icons/venlta.png
-        )
-    fi
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            NUITKA_ARGS+=(
+                --windows-icon-from-ico=resources/icons/venlta.ico
+                --windows-disable-console
+            )
+            # Windows 需要 .exe 后缀
+            # 覆盖 output-filename
+            for i in "${!NUITKA_ARGS[@]}"; do
+                if [[ "${NUITKA_ARGS[$i]}" == --output-filename=venlta ]]; then
+                    NUITKA_ARGS[$i]="--output-filename=venlta.exe"
+                fi
+            done
+            ;;
+        Linux)
+            NUITKA_ARGS+=(
+                --linux-icon=resources/icons/venlta.png
+            )
+            ;;
+        Darwin)
+            # macOS 不需要额外图标参数
+            ;;
+    esac
 
     log_info "执行 Nuitka 构建..."
     python -m nuitka "${NUITA_ARGS[@]}" backend/main.py

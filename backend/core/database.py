@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 import logging
 from core.config_manager import RULE_ARRAY_FIELDS
+from utils.constants import get_data_dir
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ class DatabaseManager:
         CREATE TABLE IF NOT EXISTS nodes (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            protocol TEXT NOT NULL CHECK (protocol IN ('vmess', 'vless', 'trojan', 'shadowsocks', 'hysteria2', 'wireguard')),
+            protocol TEXT NOT NULL CHECK (protocol IN ('vmess', 'vless', 'trojan', 'shadowsocks', 'hysteria2', 'wireguard', 'tuic')),
             address TEXT NOT NULL,
             port INTEGER NOT NULL CHECK (port > 0 AND port <= 65535),
             config TEXT NOT NULL,
@@ -111,11 +112,67 @@ class DatabaseManager:
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         """,
+        # Version 2: 路由规则增加 action 类型支持（参考 NekoBox RouteRule）
+        #
+        # action 字段支持：route（默认，路由到出站）、reject（拒绝连接）、
+        # sniff（协议嗅探）、resolve（DNS 解析）、hijack-dns（DNS 劫持）
+        # reject_method: reject action 的拒绝方式（default/conn-reset）
+        # resolve_server: resolve action 的 DNS 服务器 tag
+        #
+        # outbound_tag 对非 route action 可以为空，但保持 NOT NULL 约束以避免
+        # 大量现有代码和查询需要修改，默认值 'direct' 作为安全 fallback
+        """
+        ALTER TABLE routing_rules ADD COLUMN action TEXT NOT NULL DEFAULT 'route';
+        ALTER TABLE routing_rules ADD COLUMN reject_method TEXT;
+        ALTER TABLE routing_rules ADD COLUMN resolve_server TEXT;
+        """,
+        # Version 3: 添加 tuic 协议支持和新设置
+        #
+        # tuic 协议已加入 CHECK 约束（V1 已更新），此处重建 nodes 表以兼容已有数据库。
+        # 新设置（存储于 app_settings 键值表，无需 schema 变更）：
+        #   dns_final_out_direct, ntp_enabled, ntp_server, ntp_server_port, ntp_interval,
+        #   rule_set_cdn, adblock_enabled
+        #
+        """
+        CREATE TABLE IF NOT EXISTS nodes_new (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            protocol TEXT NOT NULL CHECK (protocol IN ('vmess', 'vless', 'trojan', 'shadowsocks', 'hysteria2', 'wireguard', 'tuic')),
+            address TEXT NOT NULL,
+            port INTEGER NOT NULL CHECK (port > 0 AND port <= 65535),
+            config TEXT NOT NULL,
+            tag TEXT NOT NULL UNIQUE,
+            group_id TEXT,
+            subscription_id TEXT,
+            is_enabled INTEGER DEFAULT 1 CHECK (is_enabled IN (0, 1)),
+            latency INTEGER,
+            speed INTEGER,
+            last_test_at TEXT,
+            sort_order INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (group_id) REFERENCES node_groups(id) ON DELETE SET NULL,
+            FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE SET NULL
+        );
+        INSERT OR IGNORE INTO nodes_new SELECT * FROM nodes;
+        DROP TABLE nodes;
+        ALTER TABLE nodes_new RENAME TO nodes;
+        CREATE INDEX IF NOT EXISTS idx_nodes_group ON nodes(group_id);
+        CREATE INDEX IF NOT EXISTS idx_nodes_sub ON nodes(subscription_id);
+        CREATE INDEX IF NOT EXISTS idx_nodes_enabled ON nodes(is_enabled);
+        """,
         # 后续迁移在此添加...
+        # Version 4: 订阅表添加 group_id，关联自动创建的分组
+        """
+        ALTER TABLE subscriptions ADD COLUMN group_id TEXT;
+        """,
     ]
 
     def __init__(self):
-        self.db_path = Path.home() / ".venlta" / "venlta.db"
+        # Backward compat: if legacy ~/.venlta exists, prefer it; otherwise use platform dir
+        legacy_dir = Path.home() / ".venlta"
+        data_dir = legacy_dir if legacy_dir.exists() else Path(get_data_dir())
+        self.db_path = data_dir / "venlta.db"
         # 确保数据库目录存在（SQLite 不会自动创建父目录）
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # 线程安全：使用 threading.local 为每个线程创建独立连接
@@ -133,7 +190,7 @@ class DatabaseManager:
         if self._shutdown:
             raise RuntimeError("DatabaseManager has been shut down, no new connections allowed")
         if not hasattr(self._local, 'conn') or self._local.conn is None:
-            conn = sqlite3.connect(str(self.db_path))
+            conn = sqlite3.connect(str(self.db_path), timeout=10)
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA journal_mode = WAL")
             conn.row_factory = sqlite3.Row
@@ -181,7 +238,7 @@ class DatabaseManager:
     # 列名白名单，防止 SQL 注入
     NODE_GROUP_COLUMNS = {'name', 'sort_order'}
     NODE_COLUMNS = {'name', 'protocol', 'address', 'port', 'config', 'tag', 'group_id', 'subscription_id', 'is_enabled', 'sort_order', 'latency', 'speed', 'last_test_at'}
-    RULE_COLUMNS = {'name', 'outbound_tag', 'domain', 'domain_suffix', 'domain_keyword', 'domain_regex', 'geosite', 'ip_cidr', 'ip_is_private', 'geoip', 'source_ip_cidr', 'source_geoip', 'port', 'port_range', 'source_port', 'source_port_range', 'process_name', 'process_path', 'package_name', 'network', 'protocol', 'user_id', 'clash_mode', 'invert', 'rule_set_id', 'is_enabled', 'sort_order'}
+    RULE_COLUMNS = {'name', 'outbound_tag', 'action', 'reject_method', 'resolve_server', 'domain', 'domain_suffix', 'domain_keyword', 'domain_regex', 'geosite', 'ip_cidr', 'ip_is_private', 'geoip', 'source_ip_cidr', 'source_geoip', 'port', 'port_range', 'source_port', 'source_port_range', 'process_name', 'process_path', 'package_name', 'network', 'protocol', 'user_id', 'clash_mode', 'invert', 'rule_set_id', 'is_enabled', 'sort_order'}
     RULE_SET_COLUMNS = {'name', 'tag', 'type', 'format', 'url', 'download_detour', 'is_enabled'}
     # 规则中的数组字段，需要 JSON 序列化/反序列化（类常量避免重复定义）
     # 引用模块级常量（config_manager.py 中定义），避免跨类/跨模块重复定义
@@ -261,6 +318,8 @@ class DatabaseManager:
     NODE_KEY_MAP_REVERSE = {v: k for k, v in NODE_KEY_MAP.items()}
     RULE_KEY_MAP = {
         'outbound_tag': 'outboundTag',
+        'reject_method': 'rejectMethod',
+        'resolve_server': 'resolveServer',
         'domain_suffix': 'domainSuffix',
         'domain_keyword': 'domainKeyword',
         'domain_regex': 'domainRegex',
@@ -506,7 +565,7 @@ class DatabaseManager:
         """更新订阅元数据（如 last_update, node_count）"""
         # 前端可能传入 camelCase 键名，自动转换为 snake_case（与其他 update 方法一致）
         updates = self._convert_keys(updates, self.SUBSCRIPTION_KEY_MAP_REVERSE)
-        allowed = {"name", "url", "last_update", "node_count", "auto_update", "update_interval"}
+        allowed = {"name", "url", "last_update", "node_count", "auto_update", "update_interval", "group_id"}
         safe_updates = {k: v for k, v in updates.items() if k in allowed}
         if not safe_updates:
             return

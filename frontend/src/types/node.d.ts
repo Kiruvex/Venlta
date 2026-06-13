@@ -1,7 +1,7 @@
 export interface NodeType {
   id: string;
   name: string;
-  protocol: 'vmess' | 'vless' | 'trojan' | 'shadowsocks' | 'hysteria2' | 'wireguard';
+  protocol: 'vmess' | 'vless' | 'trojan' | 'shadowsocks' | 'hysteria2' | 'wireguard' | 'tuic';
   address: string;
   port: number;
   tag: string;

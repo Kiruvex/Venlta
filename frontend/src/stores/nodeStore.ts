@@ -50,11 +50,26 @@ const groups = signal<NodeGroup[]>([]);
 const subscriptions = signal<Subscription[]>([]);
 const loading = signal(false);
 
+// 测试操作的全局 loading 状态（跨组件共享，信号处理器可修改）
+const isTestingLatency = signal(false);
+const isTestingAllLatency = signal(false);
+const isTestingSpeed = signal(false);
+const updatingSubId = signal<string | null>(null);
+
+// 异步测试完成追踪：记录待完成的节点数，信号回调递减，归零时清除 loading
+const _pendingLatencyCount = signal(0);    // 延迟测试待完成节点数
+const _pendingSpeedCount = signal(0);     // 速度测试待完成节点数
+const _isAllLatency = signal(false);      // 标记当前延迟测试是否为"全部测试"
+
 export const nodeStore = {
   nodes,
   groups,
   subscriptions,
   loading,
+  isTestingLatency,
+  isTestingAllLatency,
+  isTestingSpeed,
+  updatingSubId,
 
   fetchNodes: async () => {
     loading.value = true;
@@ -135,6 +150,18 @@ export const nodeStore = {
       return node;
     });
     nodes.value = updated;
+
+    // 递减待完成计数，归零时清除延迟测试 loading 状态
+    _pendingLatencyCount.value = Math.max(0, _pendingLatencyCount.value - results.length);
+    if (_pendingLatencyCount.value === 0) {
+      // 根据 _isAllLatency 标记清除对应的 loading 信号
+      if (_isAllLatency.value) {
+        isTestingAllLatency.value = false;
+        _isAllLatency.value = false;
+      } else {
+        isTestingLatency.value = false;
+      }
+    }
   },
 
   updateSpeedResults: (results: Array<{nodeId: string; speed: number; error?: string}>) => {
@@ -150,5 +177,79 @@ export const nodeStore = {
       return node;
     });
     nodes.value = updated;
+
+    // 递减待完成计数，归零时清除速度测试 loading 状态
+    _pendingSpeedCount.value = Math.max(0, _pendingSpeedCount.value - results.length);
+    if (_pendingSpeedCount.value === 0) {
+      isTestingSpeed.value = false;
+    }
+  },
+
+  // ---------- 测试操作 loading 控制 ----------
+
+  /** 开始延迟测试（设置 loading 状态，记录待完成节点数） */
+  startLatencyTest: (nodeCount: number, isAll: boolean = false) => {
+    if (isAll) {
+      isTestingAllLatency.value = true;
+      _isAllLatency.value = true;
+    } else {
+      isTestingLatency.value = true;
+    }
+    _pendingLatencyCount.value = nodeCount;
+    // 安全超时：60秒后强制清除 loading，防止信号丢失导致按钮永久禁用
+    setTimeout(() => {
+      if (_pendingLatencyCount.value > 0) {
+        console.warn('[nodeStore] Latency test safety timeout, force-clearing loading state');
+        _pendingLatencyCount.value = 0;
+        isTestingLatency.value = false;
+        isTestingAllLatency.value = false;
+        _isAllLatency.value = false;
+      }
+    }, 60000);
+  },
+
+  /** 开始速度测试（设置 loading 状态，记录待完成节点数） */
+  startSpeedTest: (nodeCount: number) => {
+    isTestingSpeed.value = true;
+    _pendingSpeedCount.value = nodeCount;
+    // 安全超时：120秒后强制清除 loading（速度测试每个节点最多10秒）
+    setTimeout(() => {
+      if (_pendingSpeedCount.value > 0) {
+        console.warn('[nodeStore] Speed test safety timeout, force-clearing loading state');
+        _pendingSpeedCount.value = 0;
+        isTestingSpeed.value = false;
+      }
+    }, 120000);
+  },
+
+  /** 设置订阅更新中状态 */
+  startSubUpdate: (subId: string) => {
+    updatingSubId.value = subId;
+    // 安全超时：30秒后强制清除
+    setTimeout(() => {
+      if (updatingSubId.value === subId) {
+        console.warn('[nodeStore] Subscription update safety timeout, force-clearing loading state');
+        updatingSubId.value = null;
+      }
+    }, 30000);
+  },
+
+  /** 清除订阅更新中状态 */
+  finishSubUpdate: () => {
+    updatingSubId.value = null;
+  },
+
+  /** 强制清除所有延迟测试 loading 状态（bridge 调用失败时使用） */
+  forceFinishLatencyTest: () => {
+    _pendingLatencyCount.value = 0;
+    isTestingLatency.value = false;
+    isTestingAllLatency.value = false;
+    _isAllLatency.value = false;
+  },
+
+  /** 强制清除速度测试 loading 状态（bridge 调用失败时使用） */
+  forceFinishSpeedTest: () => {
+    _pendingSpeedCount.value = 0;
+    isTestingSpeed.value = false;
   },
 };

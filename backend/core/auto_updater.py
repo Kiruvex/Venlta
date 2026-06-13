@@ -391,18 +391,23 @@ class AutoUpdater:
     def install_core_update(self, archive_path: str) -> dict:
         """Install downloaded sing-box core update
 
-        Extracts the sing-box binary from a .tar.gz archive and replaces the current binary.
-        The new binary is verified by running 'sing-box version' before replacing.
+        Extracts the sing-box binary from a .tar.gz or .zip archive and replaces
+        the current binary. The new binary is verified by running 'sing-box version'
+        before replacing.
 
         Args:
-            archive_path: Path to the downloaded .tar.gz file
+            archive_path: Path to the downloaded archive file (.tar.gz or .zip)
 
         Returns:
             {"ok": True} on success, {"ok": False, "error": "..."} on failure
         """
         import tarfile
+        import zipfile
         import shutil
         import stat
+
+        # Platform-specific binary name
+        binary_name = "sing-box.exe" if platform.system() == "Windows" else "sing-box"
 
         try:
             archive = Path(archive_path)
@@ -420,45 +425,79 @@ class AutoUpdater:
                 install_dir = Path(__file__).parent.parent / "sing-box"
                 install_dir.mkdir(parents=True, exist_ok=True)
 
-            # Extract sing-box binary from tar.gz
-            with tarfile.open(archive_path, 'r:gz') as tar:
-                # Find the sing-box binary in the archive
-                singbox_members = []
-                for member in tar.getmembers():
-                    # Look for sing-box binary (might be in a subdirectory like sing-box-1.13.0-linux-amd64/)
-                    if member.name.endswith('/sing-box') or member.name == 'sing-box':
-                        singbox_members.append(member)
+            # Extract to a temporary location first
+            extract_dir = Path(archive_path).parent / "singbox_update_tmp"
+            extract_dir.mkdir(parents=True, exist_ok=True)
 
-                if not singbox_members:
-                    # Try case-insensitive search
+            # Detect archive format by extension and extract sing-box binary
+            archive_suffix = archive.name.lower()
+            if archive_suffix.endswith('.zip'):
+                # Windows releases come as .zip
+                with zipfile.ZipFile(archive_path, 'r') as zf:
+                    # Find the sing-box binary in the archive
+                    singbox_entry = None
+                    for entry in zf.namelist():
+                        basename = Path(entry).name
+                        if basename == binary_name and not entry.endswith('/'):
+                            singbox_entry = entry
+                            break
+
+                    if not singbox_entry:
+                        # Try case-insensitive search
+                        for entry in zf.namelist():
+                            basename = Path(entry).name.lower()
+                            if basename == binary_name.lower() and not entry.endswith('/'):
+                                singbox_entry = entry
+                                break
+
+                    if not singbox_entry:
+                        return {"ok": False, "error": f"{binary_name} not found in archive"}
+
+                    # Extract just the binary file
+                    zf.extract(singbox_entry, extract_dir)
+                    # Move to expected location with correct name
+                    extracted_src = extract_dir / singbox_entry
+                    extracted_dst = extract_dir / binary_name
+                    if extracted_src != extracted_dst:
+                        extracted_src.rename(extracted_dst)
+            elif archive_suffix.endswith('.tar.gz') or archive_suffix.endswith('.tgz'):
+                # Linux/macOS releases come as .tar.gz
+                with tarfile.open(archive_path, 'r:gz') as tar:
+                    # Find the sing-box binary in the archive
+                    singbox_members = []
                     for member in tar.getmembers():
-                        basename = Path(member.name).name.lower()
-                        if basename == 'sing-box' and member.isfile():
+                        # Look for sing-box binary (might be in a subdirectory like sing-box-1.13.0-linux-amd64/)
+                        if member.name.endswith(f'/{binary_name}') or member.name == binary_name:
                             singbox_members.append(member)
 
-                if not singbox_members:
-                    return {"ok": False, "error": "sing-box binary not found in archive"}
+                    if not singbox_members:
+                        # Try case-insensitive search
+                        for member in tar.getmembers():
+                            basename = Path(member.name).name.lower()
+                            if basename == binary_name.lower() and member.isfile():
+                                singbox_members.append(member)
 
-                # Extract the first matching binary
-                target_member = singbox_members[0]
-                # Extract to a temporary location first
-                extract_dir = Path(archive_path).parent / "singbox_update_tmp"
-                extract_dir.mkdir(parents=True, exist_ok=True)
+                    if not singbox_members:
+                        return {"ok": False, "error": f"{binary_name} not found in archive"}
 
-                # Extract just the binary file
-                target_member.name = "sing-box"  # Rename to just 'sing-box'
-                try:
-                    tar.extract(target_member, extract_dir, filter='data')
-                except TypeError:
-                    # Python < 3.12 does not support filter parameter
-                    tar.extract(target_member, extract_dir)
+                    # Extract the first matching binary
+                    target_member = singbox_members[0]
+                    target_member.name = binary_name  # Rename to expected binary name
+                    try:
+                        tar.extract(target_member, extract_dir, filter='data')
+                    except TypeError:
+                        # Python < 3.12 does not support filter parameter
+                        tar.extract(target_member, extract_dir)
+            else:
+                return {"ok": False, "error": f"Unsupported archive format: {archive.name}"}
 
-            extracted_binary = extract_dir / "sing-box"
+            extracted_binary = extract_dir / binary_name
             if not extracted_binary.exists():
-                return {"ok": False, "error": "Failed to extract sing-box binary"}
+                return {"ok": False, "error": f"Failed to extract {binary_name}"}
 
-            # Make executable
-            extracted_binary.chmod(extracted_binary.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+            # Make executable (Unix only — chmod is meaningless on Windows)
+            if platform.system() != "Windows":
+                extracted_binary.chmod(extracted_binary.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
             # Verify the new binary works
             try:
@@ -477,7 +516,7 @@ class AutoUpdater:
 
             # Stop sing-box before replacing (caller should handle this)
             # Replace the binary
-            dest_binary = install_dir / "sing-box"
+            dest_binary = install_dir / binary_name
             if current_binary and current_binary.exists():
                 # Backup old binary
                 backup_path = current_binary.with_suffix('.bak')
@@ -553,7 +592,15 @@ class AutoUpdater:
         """
         try:
             # 流式下载，支持大文件
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+            # Derive suffix from URL so install_core_update can detect format
+            url_lower = url.lower()
+            if url_lower.endswith('.tar.gz'):
+                suffix = '.tar.gz'
+            elif url_lower.endswith('.tgz'):
+                suffix = '.tgz'
+            else:
+                suffix = '.zip'
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 with httpx.stream("GET", url, timeout=120) as resp:
                     for chunk in resp.iter_bytes(chunk_size=8192):
                         tmp.write(chunk)
