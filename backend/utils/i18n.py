@@ -67,8 +67,6 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         # 更新通知
         "tray.notification_update_title": "发现新版本",
         "tray.notification_update_available": "Venlta {{version}} 已发布，请前往设置页面更新",
-        "tray.notification_core_update_title": "核心更新可用",
-        "tray.notification_core_update_available": "sing-box {{version}} 已发布",
         # 启动错误
         "error.start_failed": "启动代理失败",
         "error.config_invalid": "配置无效，请检查设置",
@@ -96,8 +94,6 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
         # Update notification
         "tray.notification_update_title": "Update Available",
         "tray.notification_update_available": "Venlta {{version}} is available. Go to Settings to update.",
-        "tray.notification_core_update_title": "Core Update Available",
-        "tray.notification_core_update_available": "sing-box {{version}} is available",
         # Startup errors
         "error.start_failed": "Failed to start proxy",
         "error.config_invalid": "Invalid configuration, please check settings",

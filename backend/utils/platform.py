@@ -55,8 +55,10 @@ def request_admin() -> bool:
             if ctypes.windll.shell32.IsUserAnAdmin():
                 return True  # Already admin
             # Show UAC dialog to relaunch as admin
+            # 使用 subprocess.list2cmdline 正确转义参数（处理路径中的空格）
+            params = subprocess.list2cmdline(sys.argv)
             ret = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, " ".join(sys.argv), None, 1
+                None, "runas", sys.executable, params, None, 1
             )
             return ret > 32
         except Exception as e:
@@ -133,7 +135,7 @@ def get_machine_id() -> str:
     elif is_linux():
         for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"]:
             try:
-                with open(path, "r") as f:
+                with open(path, "r", encoding='utf-8') as f:
                     return f.read().strip()
             except FileNotFoundError:
                 continue

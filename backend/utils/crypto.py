@@ -55,10 +55,16 @@ def get_machine_key() -> bytes:
 
         if system == "Windows":
             try:
+                # wmic 在 Windows 11 已废弃，改用 PowerShell/CIM 命令
+                # 使用列表形式替代 shell=True，避免不必要的 cmd.exe 中间层
+                # CREATE_NO_WINDOW 防止 PowerShell 闪现控制台窗口
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0  # SW_HIDE
                 output = subprocess.check_output(
-                    # wmic 在 Windows 11 已废弃，改用 PowerShell/CIM 命令
-                    'powershell -Command "(Get-CimInstance -Class Win32_ComputerSystemProduct).UUID"',
-                    shell=True
+                    ["powershell", "-Command", "(Get-CimInstance -Class Win32_ComputerSystemProduct).UUID"],
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 ).decode()
                 fingerprint = output.strip()
             except Exception:
@@ -66,7 +72,7 @@ def get_machine_key() -> bytes:
         elif system == "Linux":
             for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"]:
                 try:
-                    with open(path, "r") as f:
+                    with open(path, "r", encoding='utf-8') as f:
                         fingerprint = f.read().strip()
                     if fingerprint:
                         break

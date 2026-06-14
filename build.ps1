@@ -1,8 +1,10 @@
 # Venlta 构建脚本 (PowerShell / Windows)
 # 用法：
-#   .\build.ps1           — 完整构建（前端 + 后端）
+#   .\build.ps1           — 完整构建（前端 + 后端 standalone 目录）
 #   .\build.ps1 frontend  — 仅构建前端
 #   .\build.ps1 backend   — 仅构建后端（需先构建前端）
+#   .\build.ps1 onefile   — 完整构建（单文件可执行）
+#   .\build.ps1 all       — 同 .\build.ps1（standalone 目录）
 
 param(
     [string]$Target = "all"
@@ -46,6 +48,8 @@ function Build-Frontend {
 
 # ── 后端构建（Nuitka） ────────────────────────────────────
 function Build-Backend {
+    param([string]$BuildMode = "standalone")
+
     # 检查前端构建产物
     if (-not (Test-Path "frontend\dist\index.html")) {
         Write-Err "前端构建产物不存在，请先运行 .\build.ps1 frontend"
@@ -64,14 +68,23 @@ function Build-Backend {
     $VERSION = $VERSION.Trim()
     Write-Info "构建 Venlta v$VERSION..."
 
+    $EXE_NAME = "Venlta.exe"
+
     # Nuitka 构建参数
-    $nuitkaArgs = @(
-        "--standalone",
+    $nuitkaArgs = @()
+
+    if ($BuildMode -eq "onefile") {
+        $nuitkaArgs += "--onefile"
+    } else {
+        $nuitkaArgs += "--standalone"
+    }
+
+    $nuitkaArgs += @(
         "--enable-plugin=pyside6",
         "--include-data-dir=frontend\dist=frontend",
-        "--include-data-dir=backend\resources=resources",
+        "--include-data-dir=resources=resources",
         "--include-data-file=VERSION=VERSION",
-        "--output-filename=venlta.exe",
+        "--output-filename=$EXE_NAME",
         "--output-dir=build",
         "--assume-yes-for-downloads",
         "--follow-imports",
@@ -80,27 +93,41 @@ function Build-Backend {
         "--windows-disable-console"
     )
 
-    Write-Info "执行 Nuitka 构建..."
+    Write-Info "执行 Nuitka 构建（模式: $BuildMode）..."
     python -m nuitka @nuitkaArgs backend\main.py
 
-    if ($LASTEXITCODE -eq 0) {
-        Write-Info "后端构建完成：build\main.dist\"
-    }
-    else {
+    if ($LASTEXITCODE -ne 0) {
         Write-Err "Nuitka 构建失败（退出码 $LASTEXITCODE）"
         exit $LASTEXITCODE
+    }
+
+    # 构建后修正文件名（Nuitka 可能忽略 --output-filename 生成 main.exe）
+    if ($BuildMode -eq "standalone") {
+        $DIST_DIR = "build\main.dist"
+        if (Test-Path "$DIST_DIR\main.exe") {
+            Move-Item -Force "$DIST_DIR\main.exe" "$DIST_DIR\$EXE_NAME"
+            Write-Info "重命名 main.exe → $EXE_NAME"
+        }
+        Write-Info "后端构建完成：$DIST_DIR\$EXE_NAME"
+    } else {
+        if (Test-Path "build\main.exe") {
+            Move-Item -Force "build\main.exe" "build\$EXE_NAME"
+            Write-Info "重命名 main.exe → $EXE_NAME"
+        }
+        Write-Info "后端构建完成：build\$EXE_NAME（单文件）"
     }
 }
 
 # ── 主流程 ────────────────────────────────────────────────
 switch ($Target) {
     "frontend" { Build-Frontend }
-    "backend"  { Build-Backend }
-    "all"      { Build-Frontend; Build-Backend }
+    "backend"  { Build-Backend -BuildMode "standalone" }
+    "onefile"  { Build-Frontend; Build-Backend -BuildMode "onefile" }
+    "all"      { Build-Frontend; Build-Backend -BuildMode "standalone" }
     default    {
-        Write-Err "用法: .\build.ps1 [frontend|backend|all]"
+        Write-Err "用法: .\build.ps1 [frontend|backend|all|onefile]"
         exit 1
     }
 }
 
-Write-Info "构建完成！"
+Write-Info "✅ 构建完成！"

@@ -8,12 +8,11 @@
 - Trigger（单击）切换窗口显示
 - 多状态图标切换
 
-托盘图标文件（预生成，由 generate_icons.py 产出）：
-- venlta-stopped.png       灰色底 — 已停止
-- venlta-running.png       绿色底 — 运行中
-- venlta-system-proxy.png  蓝色底 — 系统代理
-- venlta-tun.png           红棕底 — TUN
-- venlta-both.png          紫色底 — 系统代理 + TUN
+托盘图标文件（SVG 源文件 → PNG，由 generate_icons.py 转换）：
+- venlta-stopped.png   深蓝灰底 — 未启动代理
+- venlta-running.png   深红底   — 启动了代理（系统代理）
+- venlta-tun.png       深绿底   — 启动了 TUN
+- venlta-both.png      深紫底   — 系统代理 + TUN 都启动
 """
 
 import logging
@@ -28,11 +27,10 @@ import sys
 logger = logging.getLogger(__name__)
 
 # 状态 → 图标文件名 映射
-ICON_STOPPED = "venlta-stopped.png"
-ICON_RUNNING = "venlta-running.png"
-ICON_SYSTEM_PROXY = "venlta-system-proxy.png"
-ICON_TUN = "venlta-tun.png"
-ICON_BOTH = "venlta-both.png"
+ICON_STOPPED = "venlta-stopped.png"       # 深蓝灰底 — 未启动
+ICON_RUNNING = "venlta-running.png"       # 深红底 — 系统代理
+ICON_TUN = "venlta-tun.png"               # 深绿底 — TUN
+ICON_BOTH = "venlta-both.png"             # 深紫底 — 两者都启动
 ICON_FALLBACK = "venlta.png"
 
 
@@ -77,10 +75,8 @@ class SystemTray(QObject):
 
     def _preload_icons(self):
         """预加载所有状态图标到缓存"""
-        for name in [ICON_STOPPED, ICON_RUNNING, ICON_SYSTEM_PROXY,
-                     ICON_TUN, ICON_BOTH, ICON_FALLBACK,
-                     "venlta-disconnected.png", "venlta-connected.png",
-                     "venlta.ico"]:
+        for name in [ICON_STOPPED, ICON_RUNNING, ICON_TUN,
+                     ICON_BOTH, ICON_FALLBACK, "venlta.ico"]:
             path = self._icons_dir / name
             if path.exists():
                 self._icon_cache[name] = QIcon(str(path))
@@ -202,7 +198,15 @@ class SystemTray(QObject):
             self.toggle_tun_requested.emit(False)
 
     def _get_status_icon_name(self) -> str:
-        """根据当前状态返回对应的图标文件名"""
+        """根据当前状态返回对应的图标文件名
+
+        图标映射：
+        - 未启动代理        → venlta-stopped  (深蓝灰底)
+        - 启动了系统代理     → venlta-running  (深红底)
+        - 启动了 TUN        → venlta-tun      (深绿底)
+        - 系统代理 + TUN    → venlta-both     (深紫底)
+        - 代理运行但都没开   → venlta-running  (深红底，默认)
+        """
         if not self._is_running:
             return ICON_STOPPED
         if self._is_system_proxy_enabled and self._is_tun_enabled:
@@ -210,8 +214,9 @@ class SystemTray(QObject):
         elif self._is_tun_enabled:
             return ICON_TUN
         elif self._is_system_proxy_enabled:
-            return ICON_SYSTEM_PROXY
+            return ICON_RUNNING
         else:
+            # 代理运行中但未开启系统代理/TUN，默认使用 running 图标
             return ICON_RUNNING
 
     def _update_icon(self):
@@ -223,14 +228,7 @@ class SystemTray(QObject):
             self._tray.setIcon(icon)
             return
 
-        # 回退 1：尝试旧版 connected/disconnected 图标
-        fallback_name = "venlta-connected.png" if self._is_running else "venlta-disconnected.png"
-        icon = self._get_icon(fallback_name)
-        if not icon.isNull():
-            self._tray.setIcon(icon)
-            return
-
-        # 回退 2：原始 venlta.png / .ico
+        # 回退：原始 venlta.png / .ico
         for fb in [ICON_FALLBACK, "venlta.ico"]:
             icon = self._get_icon(fb)
             if not icon.isNull():

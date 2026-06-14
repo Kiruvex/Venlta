@@ -51,11 +51,12 @@ export interface VenltaBridge {
   checkPortConflicts(): Promise<string>;
   // 自动更新
   checkUpdate(): Promise<string>;
-  checkCoreUpdate(): Promise<string>;
   downloadLatestUpdate(): Promise<string>;
-  downloadLatestCoreUpdate(): Promise<string>;
   installAppUpdate(archivePath: string): Promise<string>;
-  installCoreUpdate(archivePath: string): Promise<string>;
+  // sing-box 核心
+  isSingboxInstalled(): Promise<string>;
+  downloadSingboxCore(): Promise<string>;
+  installSingboxCore(archivePath: string): Promise<string>;
   // i18n
   getSystemLanguage(): Promise<string>;
   getAppVersion(): Promise<string>;
@@ -190,11 +191,11 @@ export function createMockBridge(): VenltaBridge {
     setSettings: async () => JSON.stringify({ ok: true }),
     checkPortConflicts: async () => JSON.stringify({ ok: true, data: { conflicts: [] } }),
     checkUpdate: async () => JSON.stringify({ ok: true, data: null }),
-    checkCoreUpdate: async () => JSON.stringify({ ok: true, data: null }),
     downloadLatestUpdate: async () => JSON.stringify({ ok: true, data: { status: 'downloading' } }),
-    downloadLatestCoreUpdate: async () => JSON.stringify({ ok: true, data: { status: 'downloading' } }),
     installAppUpdate: async () => JSON.stringify({ ok: true }),
-    installCoreUpdate: async () => JSON.stringify({ ok: true }),
+    isSingboxInstalled: async () => JSON.stringify({ ok: true, data: { installed: true } }),
+    downloadSingboxCore: async () => JSON.stringify({ ok: true, data: { status: 'downloading' } }),
+    installSingboxCore: async () => JSON.stringify({ ok: true }),
     getSystemLanguage: async () => JSON.stringify({ ok: true, data: { language: 'en' } }),
     getAppVersion: async () => JSON.stringify({ ok: true, data: { app_version: '0.1.0', singbox_version: '1.13.13' } }),
     setBackendLanguage: async () => JSON.stringify({ ok: true }),

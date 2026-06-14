@@ -219,7 +219,7 @@ class SystemProxy:
                 # Backward compat: use legacy ~/.venlta if it exists, otherwise platform data dir
                 _legacy = Path.home() / ".venlta"
                 proxy_env_path = (_legacy if _legacy.exists() else Path(get_data_dir())) / "proxy.env"
-                with open(proxy_env_path, 'w') as f:
+                with open(proxy_env_path, 'w', encoding='utf-8') as f:
                     f.write(f"export http_proxy=http://{host}:{port}\n")
                     f.write(f"export https_proxy=http://{host}:{port}\n")
                     f.write(f"export HTTP_PROXY=http://{host}:{port}\n")

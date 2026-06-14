@@ -175,25 +175,40 @@ def main():
 
     # 加载前端
     # 开发模式加载 Vite dev server，生产模式加载打包后的静态文件
-    # 使用 sys.executable 路径推导：Nuitka 打包后 __file__ 可能指向临时解压目录，
-    # 而 sys.executable 始终指向实际可执行文件位置
+    # 路径解析策略：
+    # - Nuitka --standalone: 数据文件在 <exe_dir>/frontend/（sys.executable 同级目录）
+    # - Nuitka --onefile: 数据文件解压到临时目录（__file__ 指向临时目录）
+    # - 开发环境: frontend/dist/ 在项目根目录
     if os.getenv("VENLTA_DEV"):
         url = QUrl("http://localhost:5173")
     else:
-        # 1. Nuitka 打包后：frontend/ 在可执行文件同级目录
-        static_path = os.path.join(os.path.dirname(sys.executable), "frontend")
-        index_html = os.path.join(static_path, "index.html")
-        if not os.path.isfile(index_html):
-            # 2. 开发环境（python -m backend.main）：frontend/dist/ 在项目根目录
+        index_html = None
+        # 1. Nuitka --standalone: frontend/ 在可执行文件同级目录
+        exe_frontend = os.path.join(os.path.dirname(sys.executable), "frontend", "index.html")
+        if os.path.isfile(exe_frontend):
+            index_html = exe_frontend
+        # 2. Nuitka --onefile: frontend/ 在临时解压目录（__file__ 推导）
+        if not index_html:
+            onefile_frontend = os.path.join(_BACKEND_DIR, "frontend", "index.html")
+            if os.path.isfile(onefile_frontend):
+                index_html = onefile_frontend
+        # 3. 开发环境: frontend/dist/index.html 在项目根目录
+        if not index_html:
             project_root = os.path.dirname(_BACKEND_DIR)
-            static_path = os.path.join(project_root, "frontend", "dist")
-            index_html = os.path.join(static_path, "index.html")
-        if not os.path.isfile(index_html):
-            # 3. 兜底：尝试 frontend/ 目录（开发服务器输出）
+            dev_frontend = os.path.join(project_root, "frontend", "dist", "index.html")
+            if os.path.isfile(dev_frontend):
+                index_html = dev_frontend
+        # 4. 兜底: frontend/index.html
+        if not index_html:
             project_root = os.path.dirname(_BACKEND_DIR)
-            static_path = os.path.join(project_root, "frontend")
-            index_html = os.path.join(static_path, "index.html")
-        url = QUrl.fromLocalFile(index_html)
+            fallback_frontend = os.path.join(project_root, "frontend", "index.html")
+            if os.path.isfile(fallback_frontend):
+                index_html = fallback_frontend
+        if index_html:
+            url = QUrl.fromLocalFile(index_html)
+        else:
+            logger.error("Frontend index.html not found in any search path")
+            url = QUrl("about:blank")
     webview.load(url)
 
     # 创建主窗口（集成 WebView）
@@ -201,6 +216,26 @@ def main():
     window.setCentralWidget(webview)
     window.setWindowTitle("Venlta")
     window.resize(1000, 700)
+
+    # 设置窗口图标
+    try:
+        from PySide6.QtGui import QIcon
+        icon = QIcon()
+        # 搜索图标路径（兼容 standalone / onefile / 开发环境）
+        icon_search_paths = [
+            Path(sys.executable).parent / "resources" / "icons" / "venlta.png",
+            Path(__file__).parent.parent / "resources" / "icons" / "venlta.png",
+            Path(__file__).parent / "resources" / "icons" / "venlta.png",
+        ]
+        for icon_path in icon_search_paths:
+            if icon_path.exists():
+                icon = QIcon(str(icon_path))
+                break
+        if not icon.isNull():
+            window.setWindowIcon(icon)
+            app.setWindowIcon(icon)
+    except Exception as e:
+        logger.debug(f"Failed to set window icon: {e}")
 
     # 初始化系统托盘
     # Read saved language preference from database, apply to backend before creating tray
@@ -252,11 +287,19 @@ def main():
     QTimer.singleShot(5000, _startup_update_check)
 
     # Auto-start sing-box on app launch (delayed to allow UI to initialize first)
-    # NekoBox-style logic: sing-box starts only if at least one mode is enabled
-    # (system proxy or TUN). If both are off, sing-box stays stopped until
-    # user toggles one on.
+    # 默认不自动启动代理，用户需要手动开启。
+    # 如果用户开启了 auto_start_proxy 设置，才会在启动时自动开启上次使用的模式。
     def _startup_auto_start():
         try:
+            auto_start = config_mgr.db.get_setting('auto_start_proxy', False)
+            if not auto_start:
+                # 默认不自动启动：重置系统代理和 TUN 的启用状态
+                # 这样前端显示的状态与实际一致（都已关闭）
+                config_mgr.db.update_setting('system_proxy_enabled', False)
+                config_mgr.db.update_setting('tun_enabled', False)
+                logger.info("Auto-start proxy disabled, resetting system_proxy and TUN to off")
+                return
+
             sys_proxy_enabled = config_mgr.db.get_setting('system_proxy_enabled', False)
             tun_enabled = config_mgr.get_tun_enabled()
             if not (sys_proxy_enabled or tun_enabled):
@@ -304,8 +347,27 @@ def main():
         sys_proxy.set_enabled(False)
     app.aboutToQuit.connect(cleanup)
 
+    # 使用 os._exit() 代替正常退出，绕过 PySide6 的 destroyQCoreApplication
+    # 清理逻辑。该清理在 Python 3.14 + PySide6 环境下会触发 glibc 堆损坏
+    # （corrupted size vs. prev_size），这是 PySide6 上游 bug，无法从 Venlta 修复。
+    # os._exit() 直接终止进程，跳过 Python 解释器清理和 atexit 处理器，
+    # 避免触发有 bug 的 PySide6 析构代码。
+    import os as _os
+
+    def _clean_exit():
+        """执行清理后立即终止进程，避免 PySide6 退出时 glibc 堆损坏"""
+        try:
+            cleanup()
+        except Exception:
+            pass
+        _os._exit(0)
+
+    app.aboutToQuit.disconnect(cleanup)
+    app.aboutToQuit.connect(_clean_exit)
+
     logger.info("Venlta window created. All modules initialized. Waiting for frontend...")
-    sys.exit(app.exec())
+    ret = app.exec()
+    _os._exit(ret)
 
 if __name__ == "__main__":
     main()

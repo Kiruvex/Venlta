@@ -38,9 +38,8 @@ class VenltaBridge(QObject):
         self.port_detector = port_detector
         self.speed_tester = speed_tester
 
-        # 存储上次检查更新的结果，供下载时获取 download_url/sha256_url
+        # 存储上次检查更新的结果，供下载时获取 download_url
         self._pending_app_update = None
-        self._pending_core_update = None
 
         # 互斥锁：防止 toggleSystemProxy / toggleTun 并发执行产生竞态
         # 例如：用户快速连续切换两个开关，两者都试图 start/stop sing-box
@@ -751,8 +750,7 @@ class VenltaBridge(QObject):
         # 注意：AutoUpdater.check_update() 返回值有三种情况：
         # 1. dict（含 version/download_url 等）：有新版本
         # 2. dict（含 ok=False, error）：检查失败
-        # 3. None：无新版本
-        # 情况2不能直接用 BridgeResult.success() 包装，否则前端误认为成功
+        # 3. None：无新版本（包括 rate limit 时静默返回 None）
         if isinstance(update_info, dict) and not update_info.get("ok", True):
             return BridgeResult.fail(
                 code="UPDATE_CHECK_FAILED",
@@ -761,22 +759,6 @@ class VenltaBridge(QObject):
         # 存储检查结果供 downloadLatestUpdate 使用
         if update_info:
             self._pending_app_update = update_info
-        return BridgeResult.success(update_info)
-
-    @Slot(result=str)
-    @bridge_method
-    def checkCoreUpdate(self) -> str:
-        """检查 sing-box 核心是否有新版本"""
-        update_info = self.updater.check_singbox_update()
-        # 与 checkUpdate 一致：区分错误和无新版本
-        if isinstance(update_info, dict) and not update_info.get("ok", True):
-            return BridgeResult.fail(
-                code="CORE_UPDATE_CHECK_FAILED",
-                message=update_info.get("error", "Failed to check for core updates")
-            )
-        # 存储检查结果供 downloadLatestCoreUpdate 使用
-        if update_info:
-            self._pending_core_update = update_info
         return BridgeResult.success(update_info)
 
     @Slot(result=str)
@@ -805,47 +787,32 @@ class VenltaBridge(QObject):
 
     @Slot(result=str)
     @bridge_method
-    def downloadLatestCoreUpdate(self) -> str:
-        """下载最新 sing-box 核心更新（后台线程执行，通过 downloadProgress 信号推送进度）
+    def isSingboxInstalled(self) -> str:
+        """检查 sing-box 核心是否已安装"""
+        installed = self.updater.is_singbox_installed()
+        return BridgeResult.success({"installed": installed})
 
-        支持 SHA256 校验：如果 check_singbox_update 返回了 sha256_url，下载后自动校验。
-        """
-        if not self._pending_core_update or not self._pending_core_update.get("download_url"):
-            return BridgeResult.fail("NO_UPDATE_AVAILABLE", "No core update available to download")
-        url = self._pending_core_update["download_url"]
-        sha256_url = self._pending_core_update.get("sha256_url", "")
+    @Slot(result=str)
+    @bridge_method
+    def downloadSingboxCore(self) -> str:
+        """下载 sing-box 核心（固定版本 1.13.13），后台线程执行，通过 downloadProgress 信号推送进度"""
+        info = self.updater.get_singbox_download_info()
+        if not info or not info.get("download_url"):
+            return BridgeResult.fail("CORE_DOWNLOAD_UNAVAILABLE", "Failed to get sing-box download info")
+
+        url = info["download_url"]
+        expected_sha256 = info.get("expected_sha256", "")
 
         def _do_download():
             try:
                 self.downloadProgress.emit(BridgeResult.success({"stage": "downloading", "type": "core"}).to_json())
-                import tempfile
-                import hashlib
-                import httpx
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.gz") as tmp:
-                    with httpx.stream("GET", url, timeout=120) as resp:
-                        for chunk in resp.iter_bytes(chunk_size=8192):
-                            tmp.write(chunk)
-                    tmp_path = tmp.name
-
-                # SHA256 verification (if sha256_url is available)
-                if sha256_url:
-                    try:
-                        sha256_resp = httpx.get(sha256_url, timeout=10)
-                        if sha256_resp.status_code == 200:
-                            expected_hash = sha256_resp.text.strip().split()[0]
-                            actual_hash = hashlib.sha256(Path(tmp_path).read_bytes()).hexdigest()
-                            if actual_hash != expected_hash:
-                                logger.error(f"Core download SHA256 mismatch: expected {expected_hash}, got {actual_hash}")
-                                Path(tmp_path).unlink(missing_ok=True)
-                                self.downloadProgress.emit(BridgeResult.fail("SHA256_MISMATCH", "Download SHA256 verification failed").to_json())
-                                return
-                            logger.info(f"Core download SHA256 verified: {actual_hash[:16]}...")
-                    except Exception as sha_err:
-                        logger.warning(f"SHA256 verification skipped (non-critical): {sha_err}")
-
-                self.downloadProgress.emit(BridgeResult.success({"stage": "done", "type": "core", "path": tmp_path}).to_json())
+                result = self.updater.download_and_verify(url, expected_sha256=expected_sha256)
+                if result:
+                    self.downloadProgress.emit(BridgeResult.success({"stage": "done", "type": "core", "path": str(result)}).to_json())
+                else:
+                    self.downloadProgress.emit(BridgeResult.fail("DOWNLOAD_FAILED", "Download or SHA256 verification failed").to_json())
             except Exception as e:
-                logger.error(f"downloadLatestCoreUpdate error: {e}")
+                logger.error(f"downloadSingboxCore error: {e}")
                 self.downloadProgress.emit(BridgeResult.fail("DOWNLOAD_ERROR", str(e)).to_json())
 
         threading.Thread(target=_do_download, daemon=True).start()
@@ -853,20 +820,21 @@ class VenltaBridge(QObject):
 
     @Slot(str, result=str)
     @bridge_method
-    def installCoreUpdate(self, archive_path: str) -> str:
-        """Install downloaded sing-box core update and restart the core"""
-        # Stop sing-box first
+    def installSingboxCore(self, archive_path: str) -> str:
+        """安装下载的 sing-box 核心"""
+        # Stop sing-box first if running
         if self.singbox_mgr.get_state().get("isRunning"):
             self.singbox_mgr.stop()
         result = self.updater.install_core_update(archive_path)
         if result.get("ok"):
-            # Restart sing-box with the new binary
-            self.singbox_mgr.start()
-            return BridgeResult.success({"message": "Core updated successfully"})
+            # 更新数据库中的 sing-box 版本号，避免前端显示旧值
+            new_version = self.updater._get_current_singbox_version()
+            self.db.update_setting('singbox_version', new_version)
+            return BridgeResult.success({"message": "sing-box core installed successfully", "singbox_version": new_version})
         else:
-            # Try to restart with old binary if update failed
+            # Try to restart with old binary if install failed
             self.singbox_mgr.start()
-            return BridgeResult.fail("CORE_INSTALL_FAILED", result.get("error", "Failed to install core update"))
+            return BridgeResult.fail("CORE_INSTALL_FAILED", result.get("error", "Failed to install sing-box core"))
 
     @Slot(str, result=str)
     @bridge_method
@@ -881,30 +849,18 @@ class VenltaBridge(QObject):
     @Slot(result=str)
     @bridge_method
     def checkAndNotifyUpdates(self) -> str:
-        """Check for both app and core updates, return results for notification
+        """Check for app updates, return results for notification
 
         This is called on startup when auto_update_enabled is True.
         Results are returned synchronously so the frontend can show notifications.
         """
-        app_update = None
-        core_update = None
+        result = {}
         try:
             app_update = self.updater.check_update()
+            if app_update and isinstance(app_update, dict) and app_update.get("ok", True) and app_update.get("version"):
+                result["app"] = app_update
+                self._pending_app_update = app_update
         except Exception as e:
             logger.debug(f"Startup app update check failed: {e}")
-        try:
-            core_update = self.updater.check_singbox_update()
-        except Exception as e:
-            logger.debug(f"Startup core update check failed: {e}")
-
-        result = {}
-        # App update: filter out error results
-        if app_update and isinstance(app_update, dict) and app_update.get("ok", True) and app_update.get("version"):
-            result["app"] = app_update
-            self._pending_app_update = app_update
-        # Core update: filter out error results
-        if core_update and isinstance(core_update, dict) and core_update.get("ok", True) and core_update.get("version"):
-            result["core"] = core_update
-            self._pending_core_update = core_update
 
         return BridgeResult.success(result if result else None)

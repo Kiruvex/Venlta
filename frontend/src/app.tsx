@@ -59,6 +59,13 @@ export function App() {
       }
     }).catch(e => console.warn('[getAppVersion]', e));
 
+    // Check if sing-box core is installed, show notification if not
+    callBridge<{ installed: boolean }>('isSingboxInstalled').then(result => {
+      if (result.ok && result.data && !result.data.installed) {
+        toastStore.warning(i18next.t('settings.singbox_not_installed'));
+      }
+    }).catch(() => {});
+
     // Determine language: prefer saved preference over system locale
     // so that frontend and tray stay in sync after user changes language
     callBridge<{ language: string }>('getSystemLanguage').then(sysResult => {

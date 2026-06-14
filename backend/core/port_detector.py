@@ -1,5 +1,6 @@
 import socket
 import psutil
+import platform
 import logging
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,12 @@ class PortDetector:
 
     def get_port_process(self, port: int) -> dict | None:
         """获取占用指定端口的进程信息"""
-        for conn in psutil.net_connections(kind='inet'):
+        try:
+            connections = psutil.net_connections(kind='inet')
+        except psutil.AccessDenied:
+            # Windows 上非管理员权限可能无法列出所有连接
+            return None
+        for conn in connections:
             if conn.laddr.port == port and conn.status == 'LISTEN':
                 try:
                     proc = psutil.Process(conn.pid)
@@ -62,8 +68,8 @@ class PortDetector:
         for port in ports:
             if self.is_port_in_use(port):
                 info = self.get_port_process(port)
-                # 排除自身进程
-                if info and info.get("process") not in ("sing-box", "venlta"):
+                # 排除自身进程（Windows 上进程名带 .exe 后缀）
+                if info and not self._is_self_process(info.get("process")):
                     return info
         return None
 
@@ -73,9 +79,19 @@ class PortDetector:
         for port in ports:
             if self.is_port_in_use(port):
                 info = self.get_port_process(port)
-                if info and info.get("process") not in ("sing-box", "venlta"):
+                if info and not self._is_self_process(info.get("process")):
                     conflicts.append(info)
         return conflicts
+
+    @staticmethod
+    def _is_self_process(proc_name: str | None) -> bool:
+        """判断进程名是否为 sing-box 或 venlta 自身（兼容 Windows .exe 后缀）"""
+        if not proc_name:
+            return False
+        name = proc_name.lower()
+        # Windows: psutil 返回 "sing-box.exe" / "venlta.exe"
+        # Linux/macOS: psutil 返回 "sing-box" / "venlta"
+        return name in ("sing-box", "sing-box.exe", "venlta", "venlta.exe")
 
     def find_available_port(self, start: int, max_tries: int = 100) -> int:
         """从 start 端口开始寻找一个可用端口"""

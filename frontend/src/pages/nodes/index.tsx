@@ -352,15 +352,15 @@ export function NodesPage() {
 
       <div class="flex gap-4 min-h-0 flex-1">
         {/* ─── 侧栏：分组 + 订阅（区域滚动） ─── */}
-        <div class="w-56 shrink-0 space-y-3 overflow-y-auto">
+        <div class="w-60 shrink-0 space-y-4 overflow-y-auto">
           {/* 分组 */}
           <div class="bg-white dark:bg-gray-800/90 rounded-xl shadow-sm ring-1 ring-gray-100 dark:ring-gray-700/50 overflow-hidden">
-            <div class="px-3 py-2.5 border-b border-gray-100 dark:border-gray-700/50">
+            <div class="px-4 py-3 border-b border-gray-100 dark:border-gray-700/50">
               <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500">{t('nodes.groups') ?? 'Groups'}</h3>
             </div>
-            <div class="p-1.5 space-y-0.5">
+            <div class="p-2 space-y-1">
               <button
-                class={`w-full text-left px-3 py-1.5 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
+                class={`w-full text-left px-3 py-2 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
                   ${selectedGroup.value === '__all__' ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50'}`}
                 onClick={() => { selectedGroup.value = '__all__'; }}
               >
@@ -369,7 +369,7 @@ export function NodesPage() {
                 <span class="text-xs text-gray-400 dark:text-gray-500">{getNodeCountForGroup('__all__')}</span>
               </button>
               <button
-                class={`w-full text-left px-3 py-1.5 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
+                class={`w-full text-left px-3 py-2 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
                   ${!selectedGroup.value ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50'}`}
                 onClick={() => { selectedGroup.value = null; }}
               >
@@ -380,7 +380,7 @@ export function NodesPage() {
               {groups.map(g => (
                 <div key={g.id} class="flex items-center group">
                   <button
-                    class={`flex-1 text-left px-3 py-1.5 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
+                    class={`flex-1 text-left px-3 py-2 rounded-lg text-sm transition-all duration-150 flex items-center gap-2
                       ${selectedGroup.value === g.id ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 font-medium' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50'}`}
                     onClick={() => { selectedGroup.value = g.id; }}
                   >
@@ -388,11 +388,11 @@ export function NodesPage() {
                     <span class="flex-1 truncate">{g.name}</span>
                     <span class="text-xs text-gray-400 dark:text-gray-500">{getNodeCountForGroup(g.id)}</span>
                   </button>
-                  <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity pr-1">
-                    <button class="p-0.5 rounded text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700" onClick={() => handleRenameGroup(g.id, g.name)}>
+                  <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity pr-1.5">
+                    <button class="p-1 rounded text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700" onClick={() => handleRenameGroup(g.id, g.name)}>
                       <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
                     </button>
-                    <button class="p-0.5 rounded text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-gray-100 dark:hover:bg-gray-700" onClick={() => handleDeleteGroup(g.id)}>
+                    <button class="p-1 rounded text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-gray-100 dark:hover:bg-gray-700" onClick={() => handleDeleteGroup(g.id)}>
                       <svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
                     </button>
                   </div>
@@ -403,14 +403,14 @@ export function NodesPage() {
 
           {/* 订阅 */}
           <div class="bg-white dark:bg-gray-800/90 rounded-xl shadow-sm ring-1 ring-gray-100 dark:ring-gray-700/50 overflow-hidden">
-            <div class="px-3 py-2.5 border-b border-gray-100 dark:border-gray-700/50 flex items-center justify-between">
+            <div class="px-4 py-3 border-b border-gray-100 dark:border-gray-700/50 flex items-center justify-between">
               <h3 class="text-xs font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500">{t('nodes.subscriptions')}</h3>
             </div>
-            <div class="p-1.5 space-y-0.5">
+            <div class="p-2 space-y-1">
               {subscriptions.length === 0 ? (
                 <p class="text-xs text-gray-400 dark:text-gray-500 text-center py-3">{t('nodes.no_subscriptions')}</p>
               ) : subscriptions.map(sub => (
-                <div key={sub.id} class="flex items-center group px-2 py-1.5 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors">
+                <div key={sub.id} class="flex items-center group px-2.5 py-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/30 transition-colors">
                   <div class="flex-1 min-w-0">
                     <p class="text-sm text-gray-700 dark:text-gray-300 truncate">{sub.name}</p>
                     <p class="text-[10px] text-gray-400 dark:text-gray-500">
@@ -418,7 +418,7 @@ export function NodesPage() {
                       {sub.autoUpdate && <span class="ml-1 text-green-500">Auto</span>}
                     </p>
                   </div>
-                  <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button class="p-1 rounded text-gray-400 hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/20" disabled={nodeStore.updatingSubId.value === sub.id} onClick={async () => {
                       nodeStore.startSubUpdate(sub.id);
                       const result = await callBridge('updateSubscription', sub.id);
@@ -443,9 +443,9 @@ export function NodesPage() {
                 </div>
               ))}
               {/* 添加/编辑订阅表单 */}
-              <div class="pt-1.5 mt-1 border-t border-gray-100 dark:border-gray-700/50 space-y-1.5">
-                <input value={newSubName.value} onInput={(e: any) => { newSubName.value = e.target.value; }} placeholder={t('nodes.subscription_name')} class="w-full px-2.5 py-1.5 text-xs rounded-md border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:ring-1 focus:ring-green-500/30 focus:border-green-500" />
-                <input value={newSubUrl.value} onInput={(e: any) => { newSubUrl.value = e.target.value; }} placeholder={t('nodes.subscription_url')} class="w-full px-2.5 py-1.5 text-xs rounded-md border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:ring-1 focus:ring-green-500/30 focus:border-green-500" />
+              <div class="pt-2.5 mt-2 border-t border-gray-100 dark:border-gray-700/50 space-y-2">
+                <input value={newSubName.value} onInput={(e: any) => { newSubName.value = e.target.value; }} placeholder={t('nodes.subscription_name')} class="w-full px-2.5 py-2 text-xs rounded-md border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:ring-1 focus:ring-green-500/30 focus:border-green-500" />
+                <input value={newSubUrl.value} onInput={(e: any) => { newSubUrl.value = e.target.value; }} placeholder={t('nodes.subscription_url')} class="w-full px-2.5 py-2 text-xs rounded-md border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:ring-1 focus:ring-green-500/30 focus:border-green-500" />
                 <div class="flex items-center gap-2">
                   <label class="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400 cursor-pointer">
                     <input type="checkbox" checked={editingSubId.value ? editingSubAutoUpdate.value : newSubAutoUpdate.value} onChange={(e: any) => { if (editingSubId.value) editingSubAutoUpdate.value = e.target.checked; else newSubAutoUpdate.value = e.target.checked; }} class="h-3 w-3 rounded border-gray-300 text-green-600 dark:border-gray-600 dark:bg-gray-700" />

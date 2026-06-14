@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -194,15 +195,17 @@ class SingboxWorker(QThread):
         else:
             logger.info(f"Starting sing-box without TUN: {' '.join(cmd[:3])}...")
 
-        # ★ 使用 close_fds=False 避免 fork+exec 回退到 fork() ★
+        # ★ Linux: 使用 close_fds=False 避免 fork+exec 回退到 fork() ★
         # Python 3.12+ subprocess.Popen 默认使用 posix_spawn，但某些条件下
         # （如 text=True + close_fds=True）会回退到 fork()+exec()，
         # 在多线程 Qt 应用中可能导致 glibc 堆损坏崩溃。
         # 设置 close_fds=False 可以确保使用 posix_spawn。
         # 参考 NekoBox：使用 QProcess::start()（内部也是 posix_spawn），不存在此问题。
+        # Windows: close_fds=True 防止子进程继承不需要的文件句柄（如 SQLite 锁），
+        # 避免文件锁定问题。Windows 没有 fork，不需要 close_fds=False。
         self.process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            close_fds=False,
+            close_fds=(platform.system() != "Linux"),
         )
         self._running = True
         self._start_log_reader()
@@ -361,7 +364,12 @@ class SingboxWorker(QThread):
         self.stateChanged.emit(self.get_state())
 
     def _stop_subprocess(self):
-        """Stop a standard subprocess.Popen sing-box process"""
+        """Stop a standard subprocess.Popen sing-box process
+
+        Linux: terminate() 发送 SIGTERM，允许 sing-box 优雅清理（TUN 设备、路由表等）。
+        Windows: terminate() 调用 TerminateProcess()（硬杀），等价于 SIGKILL。
+        Windows 上系统代理由 system_proxy.py 单独清理，不受进程终止方式影响。
+        """
         if not self.process:
             return
 
@@ -418,7 +426,7 @@ class SingboxWorker(QThread):
         self._last_stderr_lines: list[str] = []
 
         def read_output(pipe, is_stderr: bool = False):
-            # 二进制模式读取（close_fds=False 不兼容 text=True）
+            # 二进制模式读取（Linux close_fds=False 不兼容 text=True）
             for line in iter(pipe.readline, b''):
                 if line:
                     try:
@@ -479,15 +487,25 @@ class SingboxWorker(QThread):
 
                 if exit_code is not None and exit_code != 0:
                     self._crash_times.append(time.time())
-                    # SIGABRT (signal 6) → exit code -6，典型于 heap corruption
-                    # SIGSEGV (signal 11) → exit code -11，典型于 null pointer dereference
                     signal_name = ""
-                    if exit_code == -6:
-                        signal_name = " (SIGABRT - likely heap corruption)"
-                    elif exit_code == -11:
-                        signal_name = " (SIGSEGV - segmentation fault)"
-                    elif exit_code == -134:
-                        signal_name = " (SIGABRT - abort())"
+                    if platform.system() == "Windows":
+                        # Windows 退出码：NTSTATUS 值（正数），不是 Unix 信号取反
+                        if exit_code == 0xC0000005:
+                            signal_name = " (ACCESS_VIOLATION - Windows equivalent of SIGSEGV)"
+                        elif exit_code == 0xC0000409:
+                            signal_name = " (STACK_BUFFER_OVERRUN - Windows equivalent of SIGABRT)"
+                        elif exit_code == 0xC0000008:
+                            signal_name = " (INVALID_HANDLE)"
+                        elif exit_code == 0xC000001D:
+                            signal_name = " (ILLEGAL_INSTRUCTION)"
+                    else:
+                        # Linux/macOS: 退出码 = -(信号号)
+                        if exit_code == -6:
+                            signal_name = " (SIGABRT - likely heap corruption)"
+                        elif exit_code == -11:
+                            signal_name = " (SIGSEGV - segmentation fault)"
+                        elif exit_code == -134:
+                            signal_name = " (SIGABRT - abort())"
                     crash_msg = (
                         f"[ERROR] sing-box crashed with code {exit_code}{signal_name}, "
                         f"TUN={'ON' if tun_enabled else 'OFF'}, "
@@ -551,7 +569,8 @@ class SingboxWorker(QThread):
             # 检查 TUN 设备是否存在
             result = subprocess.run(
                 ["ip", "link", "show", tun_ifname],
-                capture_output=True, timeout=3
+                capture_output=True, timeout=3,
+                close_fds=(platform.system() != "Linux"),
             )
             if result.returncode != 0:
                 # 设备不存在，无需清理
@@ -564,7 +583,8 @@ class SingboxWorker(QThread):
             # 1. 删除 TUN 设备（同时清理关联的路由表条目）
             result = subprocess.run(
                 ["ip", "link", "del", tun_ifname],
-                capture_output=True, timeout=5
+                capture_output=True, timeout=5,
+                close_fds=(platform.system() != "Linux"),
             )
             if result.returncode == 0:
                 logger.info(f"Successfully cleaned up leftover TUN device {tun_ifname}")
@@ -620,7 +640,7 @@ class SingboxWorker(QThread):
             # 但更安全的做法是：杀掉所有 sing-box 进程，然后重新启动
             result = subprocess.run(
                 ["pgrep", "-x", "sing-box"],
-                capture_output=True, timeout=3, close_fds=False,
+                capture_output=True, timeout=3, close_fds=(platform.system() != "Linux"),
             )
             if result.returncode != 0:
                 # 没有找到 sing-box 进程
@@ -644,7 +664,7 @@ class SingboxWorker(QThread):
             # 发送 SIGTERM 让进程优雅退出（仅 Unix — Windows 已在上方 return）
             for pid in zombie_pids:
                 try:
-                    os.kill(int(pid), subprocess.signal.SIGTERM)
+                    os.kill(int(pid), signal.SIGTERM)
                 except (ProcessLookupError, PermissionError, ValueError):
                     pass
 
@@ -657,7 +677,7 @@ class SingboxWorker(QThread):
                     os.kill(int(pid), 0)  # 检查进程是否还在
                     # 进程还在，发送 SIGKILL
                     logger.warning(f"Process {pid} did not exit gracefully, sending SIGKILL")
-                    os.kill(int(pid), subprocess.signal.SIGKILL)
+                    os.kill(int(pid), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError, ValueError):
                     pass  # 进程已退出
 

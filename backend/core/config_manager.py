@@ -30,23 +30,65 @@ RULE_ARRAY_FIELDS = frozenset({
 # 代理选择器组 tag 名称（_build_outbounds 和 _get_current_node 共同引用）
 PROXY_SELECTOR_TAG = "proxy"
 
+def get_singbox_dir() -> Path:
+    """获取 sing-box 核心安装目录（持久化路径，Nuitka 和开发环境均可用）
+
+    路径推导优先级：
+    1. Nuitka 打包后：可执行文件同级目录下的 sing-box/ 子目录
+       （sys.executable 始终指向实际可执行文件，而 __file__ 在 Nuitka 中可能不可靠）
+    2. 开发环境：backend/sing-box/ 目录（基于 __file__ 推导）
+    """
+    import sys
+    # Nuitka 打包后：使用 sys.executable 定位（与 main.py 加载 frontend 的逻辑一致）
+    # 判断是否为 Nuitka 打包环境：sys.executable 不含 "python" 且 __file__ 不可靠
+    exe_dir = Path(sys.executable).parent
+    is_nuitka = not any("python" in part.lower() for part in Path(sys.executable).parts)
+    if is_nuitka:
+        # Nuitka 环境：始终使用可执行文件同级目录（无论是否已存在）
+        return exe_dir / "sing-box"
+    # 开发环境：基于 __file__ 推导
+    dev_path = Path(__file__).parent.parent / "sing-box"
+    return dev_path
+
+
 def find_singbox_binary() -> str:
-    """统一解析 sing-box 二进制路径，优先打包目录，其次 PATH"""
-    # 1. 打包后的 resources/sing-box/ 目录
-    bundled = Path(__file__).parent.parent / "resources" / "sing-box" / ("sing-box.exe" if platform.system() == "Windows" else "sing-box")
+    """统一解析 sing-box 二进制路径（只查找自身目录，不查系统 PATH）
+
+    优先级：
+    1. Nuitka 打包后的 resources/sing-box/ 目录（预装核心）
+    2. Nuitka 打包后的可执行文件同级 sing-box/ 目录（用户安装的核心）
+    3. __file__ 推导路径（开发环境或旧版 Nuitka 兼容）
+    4. 未找到则返回空字符串
+    """
+    import sys
+    binary_name = "sing-box.exe" if platform.system() == "Windows" else "sing-box"
+    exe_dir = Path(sys.executable).parent
+
+    # 1. Nuitka 打包后的 resources/sing-box/ 目录（预装核心）
+    bundled = exe_dir / "resources" / "sing-box" / binary_name
     if bundled.exists():
         return str(bundled)
-    # 2. 系统PATH
-    path_bin = shutil.which("sing-box")
-    if path_bin:
-        return path_bin
-    # 3. 优雅降级：返回 "sing-box" 让 subprocess 在运行时查找
-    logger.warning("sing-box binary not found in resources/ or PATH, will retry at runtime")
-    return "sing-box"
+
+    # 2. Nuitka 打包后的可执行文件同级 sing-box/ 目录（用户安装的核心）
+    nuitka_installed = exe_dir / "sing-box" / binary_name
+    if nuitka_installed.exists():
+        return str(nuitka_installed)
+
+    # 3. __file__ 推导路径（开发环境或旧版 Nuitka 路径解析）
+    bundled_legacy = Path(__file__).parent.parent / "resources" / "sing-box" / binary_name
+    if bundled_legacy.exists():
+        return str(bundled_legacy)
+
+    dev_path = get_singbox_dir() / binary_name
+    if dev_path.exists():
+        return str(dev_path)
+
+    # 4. 未找到
+    logger.warning("sing-box binary not found")
+    return ""
 
 # 注意：不再在模块级别缓存 SINGBOX_BIN，因为 find_singbox_binary() 可能因环境变化返回不同结果
-# 每次调用 find_singbox_binary() 即可，开销可忽略（Path.exists() 和 shutil.which()
-# 均为轻量系统调用，且调用频率低——仅在启动/重启/更新时调用）
+# 每次调用 find_singbox_binary() 即可，开销可忽略（Path.exists() 为轻量系统调用，且调用频率低）
 class ConfigManager:
     def __init__(self, db):
         self.db = db
@@ -81,7 +123,7 @@ class ConfigManager:
         if not self._backup():
             raise RuntimeError("Config backup failed, aborting regeneration to prevent data loss")
         config = self._build_config()
-        with open(self.config_path, 'w') as f:
+        with open(self.config_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
         # 输出关键配置摘要，便于排查代理不工作等问题
         n_outbounds = len(config.get("outbounds", []))
@@ -1261,18 +1303,22 @@ class ConfigManager:
         """
         try:
             singbox_bin = find_singbox_binary()
+            if not singbox_bin:
+                logger.warning("sing-box binary not found, skipping config validation")
+                return True
             cmd = [singbox_bin, "check", "-c", str(self.config_path)]
             logger.info(f"Validating config: {' '.join(cmd[:3])}...")
 
             # 使用 posix_spawn 替代 fork+exec，避免多线程环境下的 glibc 堆损坏
             # Python 3.12+ subprocess.run() 默认使用 posix_spawn，但某些条件下
             # （如 close_fds=True + text=True）会回退到 fork+exec。
-            # 显式设置 close_fds=False 且不使用 text=True 可以确保使用 posix_spawn。
-            # 但更安全的做法是直接使用 os.posix_spawn()。
+            # Linux: close_fds=False 强制使用 posix_spawn，避免 fork+exec 回退到 fork()，
+            # 在多线程 Qt 应用中可能导致 glibc 堆损坏崩溃。
+            # Windows: close_fds=True 防止子进程继承不需要的文件句柄（如 SQLite 锁）。
             result = subprocess.run(
                 cmd,
                 capture_output=True, timeout=10,
-                close_fds=False,  # 避免 fork+exec 回退，优先使用 posix_spawn
+                close_fds=(platform.system() != "Linux"),
             )
             if result.returncode != 0:
                 stderr = result.stderr.decode(errors='replace').strip()

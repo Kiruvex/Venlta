@@ -91,7 +91,7 @@ class SubscriptionManager:
                 "x-ver-os": ver_os,
                 "x-device-model": device_model,
             }
-            resp = httpx.get(sub['url'], timeout=30, headers=request_headers)
+            resp = httpx.get(sub['url'], timeout=30, headers=request_headers, follow_redirects=True)
             if resp.status_code != 200:
                 return {"ok": False, "error": f"HTTP {resp.status_code}"}
 

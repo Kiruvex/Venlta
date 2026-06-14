@@ -44,34 +44,55 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libopengl0 libegl1 libxkbcommon0 libdbus-1-3
+          sudo apt-get install -y \
+            patchelf \
+            ccache \
+            libopengl0 libegl1 libxkbcommon0 libdbus-1-3 \
+            libxcb-xinerama0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0
 
       - name: Install Python dependencies
-        run: pip install PySide6 nuitka ordered-set
+        run: pip install PySide6 nuitka ordered-set httpx cryptography psutil
 
       - name: Build with Nuitka
+        env:
+          CCACHE_DIR: ${{ runner.temp }}/ccache
         run: |
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
           python -m nuitka --standalone \
             --enable-plugin=pyside6 \
             --include-data-dir=frontend/dist=frontend \
             --include-data-dir=resources=resources \
             --include-data-file=VERSION=VERSION \
             --linux-icon=resources/icons/venlta.png \
-            --output-filename=venlta \
+            --output-filename=Venlta \
             --output-dir=build \
             --assume-yes-for-downloads \
             --follow-imports \
+            --ccache \
             backend/main.py
 
       - name: Package
         run: |
           VERSION=$(cat VERSION 2>/dev/null || echo "0.0.0")
-          cd build/main.dist
-          tar czf ../../Venlta-${VERSION}-linux-x86_64.tar.gz .
+          DIST_DIR="build/main.dist"
+          # Nuitka 可能忽略 --output-filename，修正
+          for old in main.bin main; do
+            if [ -f "$DIST_DIR/$old" ]; then
+              mv "$DIST_DIR/$old" "$DIST_DIR/Venlta"
+              break
+            fi
+          done
+          chmod +x "$DIST_DIR/Venlta"
+          cd "$DIST_DIR"
+          tar czf "$GITHUB_WORKSPACE/Venlta-${VERSION}-linux-x86_64.tar.gz" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -95,30 +116,37 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
       - name: Install Python dependencies
-        run: pip install PySide6 nuitka ordered-set
+        run: pip install PySide6 nuitka ordered-set httpx cryptography psutil
 
       - name: Build with Nuitka
+        shell: bash
         run: |
-          python -m nuitka --standalone `
-            --enable-plugin=pyside6 `
-            --include-data-dir=frontend/dist=frontend `
-            --include-data-dir=resources=resources `
-            --include-data-file=VERSION=VERSION `
-            --windows-icon-from-ico=resources/icons/venlta.ico `
-            --windows-disable-console `
-            --output-filename=venlta.exe `
-            --output-dir=build `
-            --assume-yes-for-downloads `
-            --follow-imports `
+          python -m nuitka --standalone \
+            --enable-plugin=pyside6 \
+            --include-data-dir=frontend/dist=frontend \
+            --include-data-dir=resources=resources \
+            --include-data-file=VERSION=VERSION \
+            --windows-icon-from-ico=resources/icons/venlta.ico \
+            --windows-disable-console \
+            --output-filename=Venlta.exe \
+            --output-dir=build \
+            --assume-yes-for-downloads \
+            --follow-imports \
             backend/main.py
 
       - name: Package
         shell: pwsh
         run: |
           $ver = if (Test-Path VERSION) { (Get-Content VERSION -Raw).Trim() } else { "0.0.0" }
-          Compress-Archive -Path build/main.dist/* -DestinationPath "Venlta-$ver-windows-x86_64.zip"
+          $distDir = "build/main.dist"
+          # Nuitka 可能忽略 --output-filename，修正
+          if (Test-Path "$distDir/main.exe") {
+            Move-Item -Force "$distDir/main.exe" "$distDir/Venlta.exe"
+          }
+          Compress-Archive -Path "$distDir/*" -DestinationPath "Venlta-$ver-windows-x86_64.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

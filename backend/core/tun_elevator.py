@@ -139,7 +139,7 @@ class TunElevator:
             return {"ok": False, "error": "Capability granting is only supported on Linux"}
 
         singbox_bin = find_singbox_binary()
-        if not singbox_bin or singbox_bin == "sing-box":
+        if not singbox_bin:
             error = "sing-box binary not found. Please install sing-box first."
             logger.error(f"TUN grant_capability: {error}")
             return {"ok": False, "error": error}
@@ -154,7 +154,8 @@ class TunElevator:
         logger.info(f"TUN grant_capability: running {' '.join(cmd)}")
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=60
+                cmd, capture_output=True, text=True, timeout=60,
+                close_fds=(platform.system() != "Linux"),
             )
             logger.info(f"TUN grant_capability: rc={result.returncode}, stderr='{result.stderr.strip()}'")
             if result.returncode == 0:
@@ -309,7 +310,8 @@ class TunElevator:
             try:
                 proc = subprocess.Popen(
                     cmd, stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    close_fds=False,  # Linux: 强制 posix_spawn，避免 fork+exec glibc 堆损坏
                 )
                 return {
                     "ok": True, "method": "subprocess", "process": proc,
@@ -455,11 +457,12 @@ class TunElevator:
                 details = "Running as root"
             else:
                 singbox_bin = find_singbox_binary()
-                if singbox_bin and singbox_bin != "sing-box":
+                if singbox_bin:
                     try:
                         result = subprocess.run(
                             ["getcap", singbox_bin],
-                            capture_output=True, text=True, timeout=5
+                            capture_output=True, text=True, timeout=5,
+                            close_fds=False,  # Linux: 强制 posix_spawn
                         )
                         if result.returncode == 0:
                             caps = result.stdout.strip()
@@ -537,14 +540,15 @@ class TunElevator:
 
         # Check file capabilities on sing-box binary
         singbox_bin = find_singbox_binary()
-        if not singbox_bin or singbox_bin == "sing-box":
+        if not singbox_bin:
             logger.warning(f"TUN capability check: sing-box binary not found (find_singbox_binary returned '{singbox_bin}')")
             return False
 
         try:
             result = subprocess.run(
                 ["getcap", singbox_bin],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5,
+                close_fds=False,  # Linux: 强制 posix_spawn
             )
             logger.info(f"TUN capability check: getcap {singbox_bin} -> stdout='{result.stdout.strip()}' rc={result.returncode}")
             if result.returncode == 0 and "cap_net_admin" in result.stdout:
@@ -635,6 +639,12 @@ class TunElevator:
                 }
             else:
                 err = ctypes.GetLastError()
+                # 关闭泄漏的进程句柄（ShellExecuteExW 在失败时不会自动关闭）
+                if sei.hProcess:
+                    try:
+                        ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+                    except Exception:
+                        pass
                 if err == 1223:  # ERROR_CANCELLED
                     return {"ok": False, "method": None, "error": "UAC elevation cancelled by user"}
                 return {"ok": False, "method": None, "error": f"ShellExecuteExW failed (error {err})"}
@@ -666,6 +676,11 @@ class TunElevator:
                     return {"ok": True}
                 else:
                     err = ctypes.GetLastError()
+                    # TerminateProcess 失败时仍需关闭句柄，避免泄漏
+                    try:
+                        ctypes.windll.kernel32.CloseHandle(handle)
+                    except Exception:
+                        pass
                     logger.warning(f"TerminateProcess failed (error {err}), trying taskkill fallback")
             except Exception as e:
                 logger.warning(f"TerminateProcess exception: {e}, trying taskkill fallback")
@@ -779,7 +794,7 @@ echo $! > '{pid_file}'
 wait $!
 """
             script_path = os.path.join(tempfile.gettempdir(), "venlta_singbox_launch.sh")
-            with open(script_path, "w") as f:
+            with open(script_path, "w", encoding='utf-8') as f:
                 f.write(helper_script)
             os.chmod(script_path, 0o755)
 
@@ -800,7 +815,7 @@ wait $!
             for _ in range(10):
                 time.sleep(0.5)
                 try:
-                    with open(pid_file, "r") as f:
+                    with open(pid_file, "r", encoding='utf-8') as f:
                         pid = int(f.read().strip())
                         break
                 except (FileNotFoundError, ValueError):

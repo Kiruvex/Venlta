@@ -64,10 +64,9 @@ export function SettingsPage() {
   const savingSection = useSignal<string | null>(null);
 
   const appUpdateInfo = useSignal<Record<string, any> | null>(null);
-  const coreUpdateInfo = useSignal<Record<string, any> | null>(null);
   const appDownloadState = useSignal<DownloadState>({ stage: 'idle', type: 'app' });
   const coreDownloadState = useSignal<DownloadState>({ stage: 'idle', type: 'core' });
-  const coreUpdateAvailable = useSignal(false);
+  const singboxInstalled = useSignal<boolean | null>(null);
 
   const fetchSettings = async () => {
     const result = await callBridge<Record<string, any>>('getSettings');
@@ -80,10 +79,11 @@ export function SettingsPage() {
 
   useEffect(() => { fetchSettings(); }, []);
 
-  // Auto-update notification on startup
   useEffect(() => {
-    const bridge = (window as any).bridge;
-    if (!bridge?.checkAndNotifyUpdates) return;
+    // Check if sing-box is installed on mount
+    callBridge<{ installed: boolean }>('isSingboxInstalled').then(result => {
+      if (result.ok && result.data) singboxInstalled.value = result.data.installed;
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -139,7 +139,7 @@ export function SettingsPage() {
   const ls = localSettings.value;
   const s = settings.value;
 
-  const proxyKeys = ['http_port', 'clash_api_port', 'log_level'];
+  const proxyKeys = ['http_port', 'clash_api_port', 'log_level', 'auto_start_proxy'];
   const dnsKeys = ['dns_server_1', 'dns_server_2', 'dns_strategy', 'outbound_domain_strategy', 'utls_fingerprint', 'underlying_dns', 'fakeip_inet4_range', 'fakeip_inet6_range', 'dns_final_out_direct'];
   const tunKeys = ['tun_stack', 'tun_mtu', 'tun_strict_route', 'tun_address', 'tun_address_6', 'tun_route_exclude_address', 'tun_route_include_address', 'enable_tun_routing', 'tun_split_proxy', 'tun_split_direct', 'tun_split_block'];
   const autoUpdateKeys = ['auto_update_enabled'];
@@ -211,6 +211,9 @@ export function SettingsPage() {
             <option value="warn">warn</option>
             <option value="error">error</option>
           </select>
+        </SettingRow>
+        <SettingRow label={t('settings.auto_start_proxy')} description={t('settings.auto_start_proxy_desc')}>
+          <Switch checked={!!ls.auto_start_proxy} onChange={(v) => markDirty('proxy', 'auto_start_proxy', v)} />
         </SettingRow>
       </SettingSection>
 
@@ -426,39 +429,41 @@ export function SettingsPage() {
             <p class="text-xs text-green-600 dark:text-green-400 mt-1 animate-fade-in">{t('settings.new_version_available', { version: appUpdateInfo.value.version })}</p>
           )}
         </div>
-        {/* Core update */}
+        {/* sing-box core */}
         <div class="py-3.5 border-t border-gray-100/80 dark:border-gray-700/50">
           <div class="flex items-center justify-between">
             <div>
               <span class="text-sm font-medium text-gray-700 dark:text-gray-300">sing-box</span>
-              {coreUpdateAvailable.value && (
-                <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
-              )}
-              <p class="text-xs text-gray-500 dark:text-gray-400">{t('settings.singbox_version_with_number', { version: s.singbox_version ?? '0.0.0' })}</p>
+              <p class="text-xs text-gray-500 dark:text-gray-400">
+                {singboxInstalled.value === null ? '' : singboxInstalled.value
+                  ? t('settings.singbox_version_with_number', { version: s.singbox_version ?? '1.13.13' })
+                  : t('settings.singbox_not_installed')}
+              </p>
             </div>
             <div class="flex items-center gap-2">
-              <Button variant="secondary" size="sm" disabled={coreDownloadState.value.stage === 'downloading'} onClick={async () => {
-                try {
-                  const result = await callBridge<Record<string, any>>('checkCoreUpdate');
-                  if (result.ok && result.data) { coreUpdateInfo.value = result.data; coreUpdateAvailable.value = true; toastStore.info(t('settings.new_core_version_available', { version: result.data.version })); }
-                  else if (result.ok) { coreUpdateInfo.value = null; toastStore.info(t('settings.singbox_version_with_number', { version: t('settings.no_update') })); }
-                  else { toastStore.error(result.error?.message ?? t('settings.check_update_failed')); }
-                } catch (e) { console.warn('[checkCoreUpdate]', e); toastStore.error(t('settings.check_update_failed')); }
-              }}>{t('settings.check_core_update')}</Button>
-              {coreUpdateInfo.value && coreDownloadState.value.stage === 'idle' && (
+              {!singboxInstalled.value && coreDownloadState.value.stage === 'idle' && (
                 <Button variant="primary" size="sm" onClick={async () => {
-                  const result = await callBridge('downloadLatestCoreUpdate');
+                  const result = await callBridge('downloadSingboxCore');
                   if (!result.ok) toastStore.error(result.error?.message ?? t('settings.download_failed'));
-                }}>{t('settings.download_core_update')}</Button>
+                }}>{t('settings.download_core')}</Button>
               )}
               {coreDownloadState.value.stage === 'downloading' && (
                 <span class="text-xs text-gray-500 animate-pulse">{t('settings.downloading_core')}</span>
               )}
               {coreDownloadState.value.stage === 'done' && (
                 <Button variant="primary" size="sm" onClick={async () => {
-                  const result = await callBridge('installCoreUpdate', coreDownloadState.value.path || '');
-                  if (result.ok) { toastStore.success(t('settings.core_installed')); coreDownloadState.value = { stage: 'idle', type: 'core' }; coreUpdateInfo.value = null; coreUpdateAvailable.value = false; }
-                  else { toastStore.error(result.error?.message ?? t('settings.install_failed')); }
+                  const result = await callBridge('installSingboxCore', coreDownloadState.value.path || '');
+                  if (result.ok) {
+                    toastStore.success(t('settings.core_installed'));
+                    coreDownloadState.value = { stage: 'idle', type: 'core' };
+                    singboxInstalled.value = true;
+                    // 刷新 sing-box 版本号，避免显示 0.0.0
+                    if (result.data?.singbox_version) {
+                      settings.value = { ...settings.value, singbox_version: result.data.singbox_version };
+                    } else {
+                      fetchSettings();
+                    }
+                  } else { toastStore.error(result.error?.message ?? t('settings.install_failed')); }
                 }}>{t('settings.install_restart')}</Button>
               )}
               {coreDownloadState.value.stage === 'error' && (
@@ -466,9 +471,6 @@ export function SettingsPage() {
               )}
             </div>
           </div>
-          {coreUpdateInfo.value && coreDownloadState.value.stage === 'idle' && (
-            <p class="text-xs text-green-600 dark:text-green-400 mt-1 animate-fade-in">{t('settings.new_core_version_available', { version: coreUpdateInfo.value.version })}</p>
-          )}
         </div>
       </SettingSection>
 
