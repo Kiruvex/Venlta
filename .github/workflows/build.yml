@@ -61,11 +61,7 @@ jobs:
         run: pip install PySide6 nuitka ordered-set httpx cryptography psutil
 
       - name: Build with Nuitka
-        env:
-          CCACHE_DIR: ${{ runner.temp }}/ccache
         run: |
-          ccache --set-config=max_size=500M
-          ccache --set-config=compression=true
           python -m nuitka --standalone \
             --enable-plugin=pyside6 \
             --include-data-dir=frontend/dist=frontend \
@@ -76,7 +72,6 @@ jobs:
             --output-dir=build \
             --assume-yes-for-downloads \
             --follow-imports \
-            --ccache \
             backend/main.py
 
       - name: Package
